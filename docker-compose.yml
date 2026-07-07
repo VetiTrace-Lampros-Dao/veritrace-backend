@@ -17,6 +17,14 @@ services:
     volumes:
       - redis_data:/data
 
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
   app:
     build: .
     ports:
@@ -24,6 +32,7 @@ services:
     depends_on:
       - db
       - redis
+      - qdrant
     environment:
       - PORT=8080
       - DB_HOST=db
@@ -36,7 +45,12 @@ services:
       - REDIS_PORT=6379
       - REDIS_PASSWORD=
       - REDIS_DB=0
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6334
+      - CONTRACT_ADDRESS=${CONTRACT_ADDRESS}
+      - ARBITRUM_SEPOLIA_WS_URL=${ARBITRUM_SEPOLIA_WS_URL}
 
 volumes:
   postgres_data:
   redis_data:
+  qdrant_data:
