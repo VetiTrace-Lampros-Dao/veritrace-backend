@@ -1,0 +1,124 @@
+package listener
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"time"
+
+	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/config"
+	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/internal/content"
+	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/internal/database"
+)
+
+type KeyframePayload struct {
+	Offset uint64 `json:"offset"`
+	PHash  uint64 `json:"phash"`
+}
+
+type MetadataJSON struct {
+	SHA256              string            `json:"sha256"`
+	RepresentativePHash uint64            `json:"representative_phash"`
+	Keyframes           []KeyframePayload `json:"keyframes"`
+}
+
+type Pipeline struct {
+	cfg            *config.Config
+	contentService content.Service
+	listener       *EVMListener
+}
+
+func NewPipeline(cfg *config.Config, contentService content.Service, listener *EVMListener) *Pipeline {
+	return &Pipeline{
+		cfg:            cfg,
+		contentService: contentService,
+		listener:       listener,
+	}
+}
+
+func (p *Pipeline) Start(ctx context.Context, numWorkers int) {
+	events := p.listener.Events()
+	for i := 0; i < numWorkers; i++ {
+		go p.worker(ctx, events)
+	}
+}
+
+func (p *Pipeline) worker(ctx context.Context, events <-chan EventPayload) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case event, ok := <-events:
+			if !ok {
+				return
+			}
+			if err := p.processEvent(ctx, event); err != nil {
+				log.Printf("Pipeline: Error processing event for SHA256 %s: %v", event.Sha256Hash, err)
+			}
+		}
+	}
+}
+
+func (p *Pipeline) processEvent(ctx context.Context, event EventPayload) error {
+	record := database.ContentRecord{
+		Sha256Hash:     event.Sha256Hash,
+		CreatorAddress: event.CreatorAddress,
+		PHash:          event.PHash,
+		Timestamp:      event.Timestamp,
+		IpfsCid:        event.IpfsCid,
+		AiTool:         event.AiTool,
+	}
+
+	var keyframes []content.KeyframePayload
+	kfList, err := p.fetchKeyframes(ctx, event.IpfsCid)
+	if err == nil && len(kfList) > 0 {
+		for _, kf := range kfList {
+			keyframes = append(keyframes, content.KeyframePayload{
+				Offset: kf.Offset,
+				PHash:  kf.PHash,
+			})
+		}
+	}
+
+	if err := p.contentService.Register(ctx, record, keyframes); err != nil {
+		return fmt.Errorf("failed to register content: %w", err)
+	}
+
+	log.Printf("Pipeline successfully synced SHA256 %s", event.Sha256Hash)
+	return nil
+}
+
+func (p *Pipeline) fetchKeyframes(ctx context.Context, ipfsCid string) ([]KeyframePayload, error) {
+	if ipfsCid == "" {
+		return nil, fmt.Errorf("empty IPFS CID")
+	}
+
+	url := fmt.Sprintf("https://ipfs.io/ipfs/%s", ipfsCid)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	client := http.Client{
+		Timeout: 5 * time.Second,
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP status %d", resp.StatusCode)
+	}
+
+	var meta MetadataJSON
+	if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
+		return nil, err
+	}
+
+	return meta.Keyframes, nil
+}

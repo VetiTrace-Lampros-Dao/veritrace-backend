@@ -9,6 +9,11 @@ services:
       - POSTGRES_DB=veritrace
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d veritrace"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   redis:
     image: redis:7-alpine
@@ -30,9 +35,12 @@ services:
     ports:
       - "8080:8080"
     depends_on:
-      - db
-      - redis
-      - qdrant
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      qdrant:
+        condition: service_started
     environment:
       - PORT=8080
       - DB_HOST=db

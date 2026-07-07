@@ -13,6 +13,15 @@ import (
 	_ "github.com/lib/pq"
 )
 
+type ContentRecord struct {
+	Sha256Hash     string
+	CreatorAddress string
+	PHash          uint64
+	Timestamp      uint64
+	IpfsCid        string
+	AiTool         string
+}
+
 func ConnectPostgres(cfg *config.Config) (*sql.DB, error) {
 	dsn := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
 		cfg.DBHost, cfg.DBPort, cfg.DBUser, cfg.DBPassword, cfg.DBName, cfg.DBSslMode)
@@ -26,10 +35,19 @@ func ConnectPostgres(cfg *config.Config) (*sql.DB, error) {
 	db.SetMaxIdleConns(25)
 	db.SetConnMaxLifetime(5 * time.Minute)
 
-	if err := db.Ping(); err != nil {
-		log.Printf("Warning: Failed to ping PostgreSQL database: %v\n", err)
-	} else {
-		log.Println("Successfully connected to PostgreSQL database")
+	var pingErr error
+	for i := 0; i < 5; i++ {
+		pingErr = db.Ping()
+		if pingErr == nil {
+			log.Println("Successfully connected to PostgreSQL database")
+			break
+		}
+		log.Printf("Failed to ping PostgreSQL database (attempt %d/5): %v. Retrying in 2 seconds...\n", i+1, pingErr)
+		time.Sleep(2 * time.Second)
+	}
+
+	if pingErr != nil {
+		return nil, fmt.Errorf("database connection failed after retries: %w", pingErr)
 	}
 
 	if err := RunMigrations(db); err != nil {
