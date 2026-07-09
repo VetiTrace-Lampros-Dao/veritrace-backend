@@ -25,11 +25,12 @@ type VerificationResult struct {
 	ExactMatch      bool                    `json:"exact_match"`
 	Similarity      float64                 `json:"similarity"`
 	TimestampOffset uint64                  `json:"timestamp_offset,omitempty"`
+	MediaType       string                  `json:"media_type,omitempty"`
 	Record          *database.ContentRecord `json:"record,omitempty"`
 }
 
 type Service interface {
-	Register(ctx context.Context, record database.ContentRecord, keyframes []KeyframePayload) error
+	Register(ctx context.Context, record database.ContentRecord, keyframes []KeyframePayload, mediaType string) error
 	VerifyExact(ctx context.Context, hash string) (*VerificationResult, error)
 	VerifyFuzzy(ctx context.Context, phash uint64) (*VerificationResult, error)
 	PinToIPFS(ctx context.Context, payload interface{}) (string, error)
@@ -47,7 +48,7 @@ func NewService(repo Repository, cfg *config.Config) Service {
 	}
 }
 
-func (s *service) Register(ctx context.Context, record database.ContentRecord, keyframes []KeyframePayload) error {
+func (s *service) Register(ctx context.Context, record database.ContentRecord, keyframes []KeyframePayload, mediaType string) error {
 	if err := s.repo.SavePostgres(ctx, record); err != nil {
 		return fmt.Errorf("failed to save to postgres: %w", err)
 	}
@@ -59,15 +60,16 @@ func (s *service) Register(ctx context.Context, record database.ContentRecord, k
 	var points []*pb.PointStruct
 	if len(keyframes) > 0 {
 		for _, kf := range keyframes {
-			points = append(points, s.buildPoint(record.Sha256Hash, record.CreatorAddress, kf.PHash, kf.Offset, "video"))
+			points = append(points, s.buildPoint(record.Sha256Hash, record.CreatorAddress, kf.PHash, kf.Offset, mediaType))
 		}
 	} else {
-		points = append(points, s.buildPoint(record.Sha256Hash, record.CreatorAddress, record.PHash, 0, "image"))
+		points = append(points, s.buildPoint(record.Sha256Hash, record.CreatorAddress, record.PHash, 0, mediaType))
 	}
 
 	if err := s.repo.SaveVectors(ctx, points); err != nil {
 		return fmt.Errorf("failed to index vectors: %w", err)
 	}
+
 
 	return nil
 }
@@ -147,6 +149,12 @@ func (s *service) VerifyFuzzy(ctx context.Context, phash uint64) (*VerificationR
 		offset = uint64(offsetVal.GetIntegerValue())
 	}
 
+	mediaTypeVal, ok := payload["media_type"]
+	var mediaType string
+	if ok {
+		mediaType = mediaTypeVal.GetStringValue()
+	}
+
 	recordResult, err := s.VerifyExact(ctx, parentHash)
 	if err != nil || !recordResult.MatchFound {
 		return &VerificationResult{
@@ -161,8 +169,10 @@ func (s *service) VerifyFuzzy(ctx context.Context, phash uint64) (*VerificationR
 		ExactMatch:      false,
 		Similarity:      similarity,
 		TimestampOffset: offset,
+		MediaType:       mediaType,
 		Record:          recordResult.Record,
 	}, nil
+
 }
 
 func (s *service) buildPoint(sha256, creator string, phash, offset uint64, mediaType string) *pb.PointStruct {

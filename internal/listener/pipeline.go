@@ -21,6 +21,7 @@ type KeyframePayload struct {
 type MetadataJSON struct {
 	SHA256              string            `json:"sha256"`
 	RepresentativePHash uint64            `json:"representative_phash"`
+	MediaType           string            `json:"media_type"`
 	Keyframes           []KeyframePayload `json:"keyframes"`
 }
 
@@ -71,18 +72,27 @@ func (p *Pipeline) processEvent(ctx context.Context, event EventPayload) error {
 		AiTool:         event.AiTool,
 	}
 
+	mediaType := "image"
 	var keyframes []content.KeyframePayload
-	kfList, err := p.fetchKeyframes(ctx, event.IpfsCid)
-	if err == nil && len(kfList) > 0 {
-		for _, kf := range kfList {
+
+	meta, err := p.fetchMetadata(ctx, event.IpfsCid)
+	if err == nil && meta != nil {
+		if meta.MediaType != "" {
+			mediaType = meta.MediaType
+		} else if len(meta.Keyframes) > 0 {
+			mediaType = "video"
+		}
+		for _, kf := range meta.Keyframes {
 			keyframes = append(keyframes, content.KeyframePayload{
 				Offset: kf.Offset,
 				PHash:  kf.PHash,
 			})
 		}
+	} else if err != nil {
+		log.Printf("Pipeline warning: failed to fetch metadata for IPFS CID %s: %v", event.IpfsCid, err)
 	}
 
-	if err := p.contentService.Register(ctx, record, keyframes); err != nil {
+	if err := p.contentService.Register(ctx, record, keyframes, mediaType); err != nil {
 		return fmt.Errorf("failed to register content: %w", err)
 	}
 
@@ -90,7 +100,7 @@ func (p *Pipeline) processEvent(ctx context.Context, event EventPayload) error {
 	return nil
 }
 
-func (p *Pipeline) fetchKeyframes(ctx context.Context, ipfsCid string) ([]KeyframePayload, error) {
+func (p *Pipeline) fetchMetadata(ctx context.Context, ipfsCid string) (*MetadataJSON, error) {
 	if ipfsCid == "" {
 		return nil, fmt.Errorf("empty IPFS CID")
 	}
@@ -120,5 +130,6 @@ func (p *Pipeline) fetchKeyframes(ctx context.Context, ipfsCid string) ([]Keyfra
 		return nil, err
 	}
 
-	return meta.Keyframes, nil
+	return &meta, nil
 }
+
