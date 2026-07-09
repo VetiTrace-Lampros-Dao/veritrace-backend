@@ -54,7 +54,7 @@ func main() {
 	}()
 
 	contentRepo := content.NewRepository(db, rdb, qdrant)
-	contentService := content.NewService(contentRepo)
+	contentService := content.NewService(contentRepo, cfg)
 
 	evmListener, err := listener.NewEVMListener(cfg)
 	if err != nil {
@@ -73,7 +73,7 @@ func main() {
 
 	pipeline.Start(ctx, 5)
 
-	r := api.SetupRouter(db, rdb, qdrant)
+	r := api.SetupRouter(db, rdb, qdrant, cfg)
 
 	log.Printf("Server is running on port %s\n", cfg.Port)
 	if err := r.Run(cfg.Port); err != nil {

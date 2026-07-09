@@ -57,6 +57,7 @@ services:
       - QDRANT_PORT=6334
       - CONTRACT_ADDRESS=${CONTRACT_ADDRESS}
       - ARBITRUM_SEPOLIA_WS_URL=${ARBITRUM_SEPOLIA_WS_URL}
+      - PINATA_JWT=${PINATA_JWT}
 
 volumes:
   postgres_data:

@@ -104,6 +104,7 @@ func (l *EVMListener) Start(ctx context.Context) error {
 				time.Sleep(2 * time.Second)
 				return
 			case vLog := <-logsChan:
+				log.Printf("EVM Listener: Received raw event! Tx: %s, Block: %d, Address: %s", vLog.TxHash.Hex(), vLog.BlockNumber, vLog.Address.Hex())
 				var event struct {
 					Phash     uint64
 					Timestamp uint64
@@ -113,17 +114,19 @@ func (l *EVMListener) Start(ctx context.Context) error {
 
 				err := parsedABI.UnpackIntoInterface(&event, "ContentRegistered", vLog.Data)
 				if err != nil {
-					log.Printf("Failed to unpack event: %v", err)
+					log.Printf("EVM Listener: Failed to unpack event data: %v", err)
 					continue
 				}
 
 				if len(vLog.Topics) < 3 {
-					log.Println("Insufficient topics in log")
+					log.Printf("EVM Listener: Insufficient topics count (%d)", len(vLog.Topics))
 					continue
 				}
 
 				sha256hash := vLog.Topics[1].Hex()
 				creator := common.BytesToAddress(vLog.Topics[2].Bytes()).Hex()
+
+				log.Printf("EVM Listener: Unpacked successfully! Sha256Hash: %s, Creator: %s, PHash: %d, IpfsCid: %s, AiTool: %s", sha256hash, creator, event.Phash, event.IpfsCid, event.Aitool)
 
 				l.eventLog <- EventPayload{
 					Sha256Hash:     sha256hash,

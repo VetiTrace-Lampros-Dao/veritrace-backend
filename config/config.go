@@ -24,6 +24,7 @@ type Config struct {
 	QdrantHost      string
 	QdrantPort      string
 	ArbitrumWS      string
+	PinataJWT       string
 }
 
 func LoadConfig() *Config {
@@ -54,6 +55,7 @@ func LoadConfig() *Config {
 		QdrantHost:      getEnv("QDRANT_HOST", "localhost"),
 		QdrantPort:      getEnv("QDRANT_PORT", "6334"),
 		ArbitrumWS:      getEnv("ARBITRUM_SEPOLIA_WS_URL", ""),
+		PinataJWT:       getEnv("PINATA_JWT", ""),
 	}
 }
 

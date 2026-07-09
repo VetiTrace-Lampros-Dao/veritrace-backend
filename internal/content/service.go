@@ -1,11 +1,16 @@
 package content
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
+	"time"
 
+	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/config"
 	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/internal/database"
 	pb "github.com/qdrant/go-client/qdrant"
 )
@@ -27,15 +32,18 @@ type Service interface {
 	Register(ctx context.Context, record database.ContentRecord, keyframes []KeyframePayload) error
 	VerifyExact(ctx context.Context, hash string) (*VerificationResult, error)
 	VerifyFuzzy(ctx context.Context, phash uint64) (*VerificationResult, error)
+	PinToIPFS(ctx context.Context, payload interface{}) (string, error)
 }
 
 type service struct {
 	repo Repository
+	cfg  *config.Config
 }
 
-func NewService(repo Repository) Service {
+func NewService(repo Repository, cfg *config.Config) Service {
 	return &service{
 		repo: repo,
+		cfg:  cfg,
 	}
 }
 
@@ -198,3 +206,65 @@ func generateUUID() string {
 	b[8] = (b[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
+
+type PinataMetadata struct {
+	Name string `json:"name"`
+}
+
+type PinataPayload struct {
+	PinataContent  interface{}    `json:"pinataContent"`
+	PinataMetadata PinataMetadata `json:"pinataMetadata"`
+}
+
+type PinataResponse struct {
+	IpfsHash  string    `json:"IpfsHash"`
+	PinSize   int64     `json:"PinSize"`
+	Timestamp time.Time `json:"Timestamp"`
+}
+
+func (s *service) PinToIPFS(ctx context.Context, payload interface{}) (string, error) {
+	if s.cfg.PinataJWT == "" {
+		return "", fmt.Errorf("PINATA_JWT is not configured")
+	}
+
+	pinataPayload := PinataPayload{
+		PinataContent: payload,
+		PinataMetadata: PinataMetadata{
+			Name: fmt.Sprintf("veritrace-metadata-%d.json", time.Now().Unix()),
+		},
+	}
+
+	bodyBytes, err := json.Marshal(pinataPayload)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal pinata payload: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.pinata.cloud/pinning/pinJSONToIPFS", bytes.NewReader(bodyBytes))
+	if err != nil {
+		return "", fmt.Errorf("failed to create pinata request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+s.cfg.PinataJWT)
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to execute pinata request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		var errBody bytes.Buffer
+		_, _ = errBody.ReadFrom(resp.Body)
+		return "", fmt.Errorf("pinata API returned status %d: %s", resp.StatusCode, errBody.String())
+	}
+
+	var pinataResp PinataResponse
+	if err := json.NewDecoder(resp.Body).Decode(&pinataResp); err != nil {
+		return "", fmt.Errorf("failed to decode pinata response: %w", err)
+	}
+
+	return pinataResp.IpfsHash, nil
+}
+

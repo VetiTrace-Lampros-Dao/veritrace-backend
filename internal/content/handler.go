@@ -54,3 +54,20 @@ func (h *Handler) VerifyFuzzy(c *gin.Context) {
 
 	c.JSON(http.StatusOK, result)
 }
+
+func (h *Handler) PinToIPFS(c *gin.Context) {
+	var payload interface{}
+	if err := c.ShouldBindJSON(&payload); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid json payload: " + err.Error()})
+		return
+	}
+
+	ipfsCID, err := h.service.PinToIPFS(c.Request.Context(), payload)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"ipfs_cid": ipfsCID})
+}
+
