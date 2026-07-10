@@ -25,6 +25,12 @@ type Config struct {
 	QdrantPort      string
 	ArbitrumWS      string
 	PinataJWT       string
+	S3Endpoint      string
+	S3PublicEndpoint string
+	S3AccessKey     string
+	S3SecretKey     string
+	S3Bucket        string
+	S3Region        string
 }
 
 func LoadConfig() *Config {
@@ -38,6 +44,9 @@ func LoadConfig() *Config {
 		log.Printf("Invalid REDIS_DB value '%s', defaulting to 0: %v\n", redisDBStr, err)
 		redisDB = 0
 	}
+
+	s3Endpoint := getEnv("S3_ENDPOINT", "")
+	s3PublicEndpoint := getEnv("S3_PUBLIC_ENDPOINT", s3Endpoint)
 
 	return &Config{
 		Port:            ":" + getEnv("PORT", "8080"),
@@ -56,6 +65,12 @@ func LoadConfig() *Config {
 		QdrantPort:      getEnv("QDRANT_PORT", "6334"),
 		ArbitrumWS:      getEnv("ARBITRUM_SEPOLIA_WS_URL", ""),
 		PinataJWT:       getEnv("PINATA_JWT", ""),
+		S3Endpoint:      s3Endpoint,
+		S3PublicEndpoint: s3PublicEndpoint,
+		S3AccessKey:     getEnv("S3_ACCESS_KEY", ""),
+		S3SecretKey:     getEnv("S3_SECRET_KEY", ""),
+		S3Bucket:        getEnv("S3_BUCKET", "veritrace"),
+		S3Region:        getEnv("S3_REGION", "us-east-1"),
 	}
 }
 

@@ -6,7 +6,9 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"time"
 
@@ -34,17 +36,20 @@ type Service interface {
 	VerifyExact(ctx context.Context, hash string) (*VerificationResult, error)
 	VerifyFuzzy(ctx context.Context, phash uint64) (*VerificationResult, error)
 	PinToIPFS(ctx context.Context, payload interface{}) (string, error)
+	PinFile(ctx context.Context, reader io.Reader, filename, contentType string) (string, string, error)
 }
 
 type service struct {
-	repo Repository
-	cfg  *config.Config
+	repo    Repository
+	cfg     *config.Config
+	storage StorageProvider
 }
 
-func NewService(repo Repository, cfg *config.Config) Service {
+func NewService(repo Repository, cfg *config.Config, storage StorageProvider) Service {
 	return &service{
-		repo: repo,
-		cfg:  cfg,
+		repo:    repo,
+		cfg:     cfg,
+		storage: storage,
 	}
 }
 
@@ -69,7 +74,6 @@ func (s *service) Register(ctx context.Context, record database.ContentRecord, k
 	if err := s.repo.SaveVectors(ctx, points); err != nil {
 		return fmt.Errorf("failed to index vectors: %w", err)
 	}
-
 
 	return nil
 }
@@ -278,3 +282,72 @@ func (s *service) PinToIPFS(ctx context.Context, payload interface{}) (string, e
 	return pinataResp.IpfsHash, nil
 }
 
+func (s *service) PinFile(ctx context.Context, reader io.Reader, filename, contentType string) (string, string, error) {
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to read upload file bytes: %w", err)
+	}
+
+	ipfsHash, err := s.pinFileToIPFS(ctx, bytes.NewReader(data), filename)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to pin file to IPFS: %w", err)
+	}
+	ipfsUrl := fmt.Sprintf("https://gateway.pinata.cloud/ipfs/%s", ipfsHash)
+
+	s3Url, err := s.storage.UploadFile(ctx, bytes.NewReader(data), filename, contentType)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to upload file to S3: %w", err)
+	}
+
+	return ipfsUrl, s3Url, nil
+}
+
+func (s *service) pinFileToIPFS(ctx context.Context, reader io.Reader, filename string) (string, error) {
+	if s.cfg.PinataJWT == "" {
+		return "", fmt.Errorf("PINATA_JWT is not configured")
+	}
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+
+	part, err := writer.CreateFormFile("file", filename)
+	if err != nil {
+		return "", fmt.Errorf("failed to create multipart form file: %w", err)
+	}
+
+	if _, err := io.Copy(part, reader); err != nil {
+		return "", fmt.Errorf("failed to copy file bytes to multipart: %w", err)
+	}
+
+	if err := writer.Close(); err != nil {
+		return "", fmt.Errorf("failed to close multipart writer: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.pinata.cloud/pinning/pinFileToIPFS", body)
+	if err != nil {
+		return "", fmt.Errorf("failed to create pinata file request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer "+s.cfg.PinataJWT)
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to execute pinata file request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		var errBody bytes.Buffer
+		_, _ = errBody.ReadFrom(resp.Body)
+		return "", fmt.Errorf("pinata API returned status %d: %s", resp.StatusCode, errBody.String())
+	}
+
+	var pinataResp PinataResponse
+	if err := json.NewDecoder(resp.Body).Decode(&pinataResp); err != nil {
+		return "", fmt.Errorf("failed to decode pinata file response: %w", err)
+	}
+
+	return pinataResp.IpfsHash, nil
+}

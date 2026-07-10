@@ -53,8 +53,16 @@ func main() {
 		}
 	}()
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	storage, err := content.InitStorageProvider(ctx, cfg)
+	if err != nil {
+		log.Printf("Server warning: failed to initialize storage provider: %v", err)
+	}
+
 	contentRepo := content.NewRepository(db, rdb, qdrant)
-	contentService := content.NewService(contentRepo, cfg)
+	contentService := content.NewService(contentRepo, cfg, storage)
 
 	evmListener, err := listener.NewEVMListener(cfg)
 	if err != nil {
@@ -63,9 +71,6 @@ func main() {
 	defer evmListener.Close()
 
 	pipeline := listener.NewPipeline(cfg, contentService, evmListener)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	if err := evmListener.Start(ctx); err != nil {
 		log.Fatalf("Critical error starting EVM listener: %v", err)

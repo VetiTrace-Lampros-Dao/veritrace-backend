@@ -71,3 +71,30 @@ func (h *Handler) PinToIPFS(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ipfs_cid": ipfsCID})
 }
 
+func (h *Handler) PinFile(c *gin.Context) {
+	header, err := c.FormFile("file")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing file parameter: " + err.Error()})
+		return
+	}
+
+	file, err := header.Open()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to open uploaded file: " + err.Error()})
+		return
+	}
+	defer file.Close()
+
+	ipfsUrl, s3Url, err := h.service.PinFile(c.Request.Context(), file, header.Filename, header.Header.Get("Content-Type"))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"media_ipfs_url": ipfsUrl,
+		"media_s3_url":   s3Url,
+	})
+}
+
+

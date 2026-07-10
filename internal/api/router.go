@@ -1,7 +1,9 @@
 package api
 
 import (
+	"context"
 	"database/sql"
+	"log"
 
 	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/config"
 	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/internal/content"
@@ -34,12 +36,19 @@ func SetupRouter(db *sql.DB, rdb *redis.Client, qdrant *vector.QdrantClient, cfg
 	r.Use(gin.Recovery())
 	r.Use(gin.Logger())
 
+	r.Static("/uploads", "./uploads")
+
 	healthRepo := health.NewRepository(db, rdb)
 	healthService := health.NewService(healthRepo)
 	healthHandler := health.NewHandler(healthService)
 
+	storage, err := content.InitStorageProvider(context.Background(), cfg)
+	if err != nil {
+		log.Printf("Router warning: failed to initialize storage provider: %v", err)
+	}
+
 	contentRepo := content.NewRepository(db, rdb, qdrant)
-	contentService := content.NewService(contentRepo, cfg)
+	contentService := content.NewService(contentRepo, cfg, storage)
 	contentHandler := content.NewHandler(contentService)
 
 	r.GET("/health", healthHandler.CheckHealth)
@@ -47,6 +56,7 @@ func SetupRouter(db *sql.DB, rdb *redis.Client, qdrant *vector.QdrantClient, cfg
 	r.GET("/api/v1/verify/exact", contentHandler.VerifyExact)
 	r.GET("/api/v1/verify/fuzzy", contentHandler.VerifyFuzzy)
 	r.POST("/api/v1/pin", contentHandler.PinToIPFS)
+	r.POST("/api/v1/pin-file", contentHandler.PinFile)
 
 	return r
 }
