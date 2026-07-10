@@ -14,12 +14,16 @@ import (
 )
 
 type ContentRecord struct {
-	Sha256Hash     string
-	CreatorAddress string
-	PHash          uint64
-	Timestamp      uint64
-	IpfsCid        string
-	AiTool         string
+	Sha256Hash      string
+	CreatorAddress  string
+	PHash           uint64
+	Timestamp       uint64
+	IpfsCid         string
+	AiTool          string
+	MediaIpfsUrl    string
+	MediaS3Url      string
+	AllowAiTraining bool
+	MediaType       string
 }
 
 func ConnectPostgres(cfg *config.Config) (*sql.DB, error) {

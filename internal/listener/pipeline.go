@@ -22,6 +22,9 @@ type MetadataJSON struct {
 	SHA256              string            `json:"sha256"`
 	RepresentativePHash uint64            `json:"representative_phash"`
 	MediaType           string            `json:"media_type"`
+	MediaIpfsUrl        string            `json:"media_ipfs_url"`
+	MediaS3Url          string            `json:"media_s3_url"`
+	AllowAiTraining     bool              `json:"allow_ai_training"`
 	Keyframes           []KeyframePayload `json:"keyframes"`
 }
 
@@ -88,9 +91,14 @@ func (p *Pipeline) processEvent(ctx context.Context, event EventPayload) error {
 				PHash:  kf.PHash,
 			})
 		}
+		record.MediaIpfsUrl = meta.MediaIpfsUrl
+		record.MediaS3Url = meta.MediaS3Url
+		record.AllowAiTraining = meta.AllowAiTraining
 	} else if err != nil {
 		log.Printf("Pipeline warning: failed to fetch metadata for IPFS CID %s: %v", event.IpfsCid, err)
 	}
+
+	record.MediaType = mediaType
 
 	if err := p.contentService.Register(ctx, record, keyframes, mediaType); err != nil {
 		return fmt.Errorf("failed to register content: %w", err)

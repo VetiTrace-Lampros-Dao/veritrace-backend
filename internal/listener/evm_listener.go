@@ -83,58 +83,86 @@ func (l *EVMListener) Start(ctx context.Context) error {
 		},
 	}
 
-	logsChan := make(chan types.Log)
-	sub, err := l.client.SubscribeFilterLogs(ctx, query, logsChan)
-	if err != nil {
-		return fmt.Errorf("failed to subscribe to contract logs: %w", err)
-	}
-
 	go func() {
-		defer sub.Unsubscribe()
 		defer close(l.eventLog)
 
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case err := <-sub.Err():
-				if err != nil {
-					log.Printf("EVM subscription error: %v", err)
-				}
-				time.Sleep(2 * time.Second)
-				return
-			case vLog := <-logsChan:
-				log.Printf("EVM Listener: Received raw event! Tx: %s, Block: %d, Address: %s", vLog.TxHash.Hex(), vLog.BlockNumber, vLog.Address.Hex())
-				var event struct {
-					Phash     uint64
-					Timestamp uint64
-					IpfsCid   string
-					Aitool    string
+			default:
+				if l.client == nil {
+					client, err := ethclient.Dial(l.cfg.ArbitrumWS)
+					if err != nil {
+						log.Printf("EVM Listener: Dial failed: %v. Retrying in 5s...", err)
+						time.Sleep(5 * time.Second)
+						continue
+					}
+					l.client = client
 				}
 
-				err := parsedABI.UnpackIntoInterface(&event, "ContentRegistered", vLog.Data)
+				logsChan := make(chan types.Log)
+				sub, err := l.client.SubscribeFilterLogs(ctx, query, logsChan)
 				if err != nil {
-					log.Printf("EVM Listener: Failed to unpack event data: %v", err)
+					log.Printf("EVM Listener: Subscription failed: %v. Retrying in 5s...", err)
+					l.client.Close()
+					l.client = nil
+					time.Sleep(5 * time.Second)
 					continue
 				}
 
-				if len(vLog.Topics) < 3 {
-					log.Printf("EVM Listener: Insufficient topics count (%d)", len(vLog.Topics))
-					continue
-				}
+				log.Printf("EVM Listener: Successfully connected & subscribed to Arbitrum Sepolia")
 
-				sha256hash := vLog.Topics[1].Hex()
-				creator := common.BytesToAddress(vLog.Topics[2].Bytes()).Hex()
+				errChan := sub.Err()
+				keepRunning := true
+				for keepRunning {
+					select {
+					case <-ctx.Done():
+						sub.Unsubscribe()
+						return
+					case subErr := <-errChan:
+						if subErr != nil {
+							log.Printf("EVM subscription error: %v. Reconnecting...", subErr)
+						}
+						sub.Unsubscribe()
+						l.client.Close()
+						l.client = nil
+						keepRunning = false
+						time.Sleep(2 * time.Second)
+					case vLog := <-logsChan:
+						log.Printf("EVM Listener: Received raw event! Tx: %s, Block: %d, Address: %s", vLog.TxHash.Hex(), vLog.BlockNumber, vLog.Address.Hex())
+						var event struct {
+							Phash     uint64
+							Timestamp uint64
+							IpfsCid   string
+							Aitool    string
+						}
 
-				log.Printf("EVM Listener: Unpacked successfully! Sha256Hash: %s, Creator: %s, PHash: %d, IpfsCid: %s, AiTool: %s", sha256hash, creator, event.Phash, event.IpfsCid, event.Aitool)
+						err := parsedABI.UnpackIntoInterface(&event, "ContentRegistered", vLog.Data)
+						if err != nil {
+							log.Printf("EVM Listener: Failed to unpack event data: %v", err)
+							continue
+						}
 
-				l.eventLog <- EventPayload{
-					Sha256Hash:     sha256hash,
-					CreatorAddress: creator,
-					PHash:          event.Phash,
-					Timestamp:      event.Timestamp,
-					IpfsCid:        event.IpfsCid,
-					AiTool:         event.Aitool,
+						if len(vLog.Topics) < 3 {
+							log.Printf("EVM Listener: Insufficient topics count (%d)", len(vLog.Topics))
+							continue
+						}
+
+						sha256hash := vLog.Topics[1].Hex()
+						creator := common.BytesToAddress(vLog.Topics[2].Bytes()).Hex()
+
+						log.Printf("EVM Listener: Unpacked successfully! Sha256Hash: %s, Creator: %s, PHash: %d, IpfsCid: %s, AiTool: %s", sha256hash, creator, event.Phash, event.IpfsCid, event.Aitool)
+
+						l.eventLog <- EventPayload{
+							Sha256Hash:     sha256hash,
+							CreatorAddress: creator,
+							PHash:          event.Phash,
+							Timestamp:      event.Timestamp,
+							IpfsCid:        event.IpfsCid,
+							AiTool:         event.Aitool,
+						}
+					}
 				}
 			}
 		}
