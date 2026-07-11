@@ -19,6 +19,7 @@ import (
 	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/config"
 	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/internal/database"
 	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/internal/onchain"
+	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/internal/webhook"
 	pb "github.com/qdrant/go-client/qdrant"
 )
 
@@ -53,14 +54,14 @@ type SegmentVerificationResult struct {
 }
 
 type VerificationCertificate struct {
-	CertificateID   string  `json:"certificate_id"`
-	IssuedAt        string  `json:"issued_at"`
-	TargetHash      string  `json:"target_hash"`
-	MatchFound      bool    `json:"match_found"`
-	OriginalCreator string  `json:"original_creator,omitempty"`
-	OnChainTxHash   string  `json:"on_chain_tx_hash,omitempty"`
-	IpfsCid         string  `json:"ipfs_cid,omitempty"`
-	Signature       string  `json:"signature"`
+	CertificateID   string `json:"certificate_id"`
+	IssuedAt        string `json:"issued_at"`
+	TargetHash      string `json:"target_hash"`
+	MatchFound      bool   `json:"match_found"`
+	OriginalCreator string `json:"original_creator,omitempty"`
+	OnChainTxHash   string `json:"on_chain_tx_hash,omitempty"`
+	IpfsCid         string `json:"ipfs_cid,omitempty"`
+	Signature       string `json:"signature"`
 }
 
 type Service interface {
@@ -80,14 +81,16 @@ type service struct {
 	cfg             *config.Config
 	storage         StorageProvider
 	onchainVerifier *onchain.Verifier
+	dispatcher      webhook.Dispatcher
 }
 
-func NewService(repo Repository, cfg *config.Config, storage StorageProvider, onchainVerifier *onchain.Verifier) Service {
+func NewService(repo Repository, cfg *config.Config, storage StorageProvider, onchainVerifier *onchain.Verifier, dispatcher webhook.Dispatcher) Service {
 	return &service{
 		repo:            repo,
 		cfg:             cfg,
 		storage:         storage,
 		onchainVerifier: onchainVerifier,
+		dispatcher:      dispatcher,
 	}
 }
 
@@ -134,6 +137,17 @@ func (s *service) VerifyExact(ctx context.Context, hash string) (*VerificationRe
 	cached, err := s.repo.GetCache(ctx, hash)
 	if err == nil && cached != nil {
 		verified, txHash := s.crossCheckBlockchain(ctx, hash, cached.IpfsCid)
+
+		if cached.WebhookUrl != "" {
+			s.dispatcher.Dispatch(cached.WebhookUrl, webhook.Payload{
+				EventType:    webhook.EventMatchDetected,
+				OriginalHash: cached.Sha256Hash,
+				Similarity:   100.0,
+				Timestamp:    time.Now().UTC().Format(time.RFC3339),
+				Message:      fmt.Sprintf("An exact match of your registered asset (%s) was verified.", cached.Sha256Hash),
+			})
+		}
+
 		return &VerificationResult{
 			MatchFound:      true,
 			ExactMatch:      true,
@@ -157,7 +171,17 @@ func (s *service) VerifyExact(ctx context.Context, hash string) (*VerificationRe
 
 	_ = s.repo.SaveCache(ctx, *record)
 
-	verified, txHash := s.crossCheckBlockchain(ctx, hash, record.IpfsCid)
+	verified, txHash := s.crossCheckBlockchain(ctx, record.Sha256Hash, record.IpfsCid)
+
+	if record.WebhookUrl != "" {
+		s.dispatcher.Dispatch(record.WebhookUrl, webhook.Payload{
+			EventType:    webhook.EventMatchDetected,
+			OriginalHash: record.Sha256Hash,
+			Similarity:   100.0,
+			Timestamp:    time.Now().UTC().Format(time.RFC3339),
+			Message:      fmt.Sprintf("An exact match of your registered asset (%s) was verified.", record.Sha256Hash),
+		})
+	}
 
 	return &VerificationResult{
 		MatchFound:      true,
@@ -269,6 +293,16 @@ func (s *service) VerifyFuzzy(ctx context.Context, phash uint64) (*VerificationR
 	similarity := ((64.0 - distance) / 64.0) * 100.0
 
 	verified, txHash := s.crossCheckBlockchain(ctx, recordResult.Record.Sha256Hash, recordResult.Record.IpfsCid)
+
+	if recordResult.Record.WebhookUrl != "" {
+		s.dispatcher.Dispatch(recordResult.Record.WebhookUrl, webhook.Payload{
+			EventType:    webhook.EventDerivativeDetected,
+			OriginalHash: recordResult.Record.Sha256Hash,
+			Similarity:   similarity,
+			Timestamp:    time.Now().UTC().Format(time.RFC3339),
+			Message:      fmt.Sprintf("A derivative copy of your registered asset (%s) was verified.", recordResult.Record.Sha256Hash),
+		})
+	}
 
 	return &VerificationResult{
 		MatchFound:      true,
@@ -390,6 +424,16 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 
 	verified, txHash := s.crossCheckBlockchain(ctx, parentResult.Record.Sha256Hash, parentResult.Record.IpfsCid)
 
+	if parentResult.Record.WebhookUrl != "" {
+		s.dispatcher.Dispatch(parentResult.Record.WebhookUrl, webhook.Payload{
+			EventType:    webhook.EventDerivativeDetected,
+			OriginalHash: parentResult.Record.Sha256Hash,
+			Similarity:   similarity,
+			Timestamp:    time.Now().UTC().Format(time.RFC3339),
+			Message:      fmt.Sprintf("A matching segment of your registered asset (%s) was verified.", parentResult.Record.Sha256Hash),
+		})
+	}
+
 	result := &SegmentVerificationResult{
 		MatchFound:              true,
 		ExactMatch:              false,
@@ -421,23 +465,23 @@ func (s *service) crossCheckBlockchain(ctx context.Context, sha256Hex, expectedC
 	if s.onchainVerifier == nil {
 		return false, ""
 	}
-	
+
 	onChainRec, err := s.onchainVerifier.VerifyHash(ctx, sha256Hex)
 	if err != nil {
 		log.Printf("Blockchain cross-check failed for %s: %v", sha256Hex, err)
 		return false, ""
 	}
-	
+
 	if onChainRec == nil {
 		log.Printf("Blockchain cross-check failed: %s not found on-chain", sha256Hex)
 		return false, ""
 	}
-	
+
 	if onChainRec.IpfsCid != expectedCid {
 		log.Printf("Blockchain cross-check failed: CID mismatch for %s. Expected %s, got %s", sha256Hex, expectedCid, onChainRec.IpfsCid)
 		return false, onChainRec.TxHash
 	}
-	
+
 	return true, onChainRec.TxHash
 }
 

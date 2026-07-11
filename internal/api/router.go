@@ -10,6 +10,7 @@ import (
 	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/internal/health"
 	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/internal/onchain"
 	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/internal/vector"
+	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/internal/webhook"
 	"github.com/gin-gonic/gin"
 	pb "github.com/qdrant/go-client/qdrant"
 	"github.com/redis/go-redis/v9"
@@ -55,7 +56,8 @@ func SetupRouter(db *sql.DB, rdb *redis.Client, qdrant *vector.QdrantClient, cfg
 	}
 
 	contentRepo := content.NewRepository(db, rdb, qdrant)
-	contentService := content.NewService(contentRepo, cfg, storage, onchainVerifier)
+	dispatcher := webhook.NewDispatcher()
+	contentService := content.NewService(contentRepo, cfg, storage, onchainVerifier, dispatcher)
 	contentHandler := content.NewHandler(contentService)
 
 	r.GET("/health", healthHandler.CheckHealth)

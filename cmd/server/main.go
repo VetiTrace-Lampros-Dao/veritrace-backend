@@ -11,6 +11,7 @@ import (
 	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/internal/listener"
 	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/internal/onchain"
 	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/internal/vector"
+	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/internal/webhook"
 )
 
 func main() {
@@ -69,7 +70,8 @@ func main() {
 	defer onchainVerifier.Close()
 
 	contentRepo := content.NewRepository(db, rdb, qdrant)
-	contentService := content.NewService(contentRepo, cfg, storage, onchainVerifier)
+	dispatcher := webhook.NewDispatcher()
+	contentService := content.NewService(contentRepo, cfg, storage, onchainVerifier, dispatcher)
 
 	evmListener, err := listener.NewEVMListener(cfg, contentService)
 	if err != nil {

@@ -24,6 +24,7 @@ type ContentRecord struct {
 	MediaS3Url      string
 	AllowAiTraining bool
 	MediaType       string
+	WebhookUrl      string
 }
 
 func ConnectPostgres(cfg *config.Config) (*sql.DB, error) {
