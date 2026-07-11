@@ -128,7 +128,7 @@ func (l *EVMListener) Start(ctx context.Context) error {
 
 				if lastBlock < currentHead {
 					gap := currentHead - lastBlock
-					if gap > 100 {
+					if gap > 10000 {
 						log.Printf("EVM Listener: Warning: checkpoint is too far behind current head (%d blocks). Resetting checkpoint to %d to avoid rate limits.", gap, currentHead)
 						if err := l.service.SaveCheckpoint(ctx, "evm_listener", currentHead); err != nil {
 							log.Printf("EVM Listener: Failed to save checkpoint %d: %v", currentHead, err)

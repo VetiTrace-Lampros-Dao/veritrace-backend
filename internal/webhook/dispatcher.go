@@ -22,7 +22,6 @@ type Payload struct {
 	Timestamp    string    `json:"timestamp"`
 	Message      string    `json:"message"`
 
-	// Cross-compatibility fields for Discord and Slack
 	Content string `json:"content,omitempty"`
 	Text    string `json:"text,omitempty"`
 }
@@ -46,7 +45,6 @@ func (d *dispatcher) Dispatch(url string, payload Payload) {
 		return
 	}
 
-	// Map message to native platform keys for Discord/Slack compatibility
 	payload.Content = payload.Message
 	payload.Text = payload.Message
 

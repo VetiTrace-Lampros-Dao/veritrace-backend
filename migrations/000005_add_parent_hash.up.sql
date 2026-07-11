@@ -1,0 +1,2 @@
+ALTER TABLE content_records ADD COLUMN IF NOT EXISTS parent_sha256 VARCHAR(66) DEFAULT '';
+ALTER TABLE content_records ALTER COLUMN parent_sha256 TYPE VARCHAR(66);

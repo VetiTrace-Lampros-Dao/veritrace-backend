@@ -68,6 +68,7 @@ func SetupRouter(db *sql.DB, rdb *redis.Client, qdrant *vector.QdrantClient, cfg
 	r.POST("/api/v1/verify/segments", contentHandler.VerifySegments)
 	r.POST("/api/v1/pin", contentHandler.PinToIPFS)
 	r.POST("/api/v1/pin-file", contentHandler.PinFile)
+	r.GET("/api/v1/content/:hash/lineage", contentHandler.GetLineage)
 
 	r.POST("/api/v1/dev/flush", func(c *gin.Context) {
 		_, err := db.Exec("TRUNCATE TABLE content_records, sync_checkpoints RESTART IDENTITY;")

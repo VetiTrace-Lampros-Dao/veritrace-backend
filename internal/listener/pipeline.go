@@ -26,6 +26,7 @@ type MetadataJSON struct {
 	MediaS3Url          string            `json:"media_s3_url"`
 	AllowAiTraining     bool              `json:"allow_ai_training"`
 	WebhookUrl          string            `json:"webhook_url"`
+	ParentSha256        string            `json:"parent_sha256"`
 	Keyframes           []KeyframePayload `json:"keyframes"`
 }
 
@@ -96,6 +97,7 @@ func (p *Pipeline) processEvent(ctx context.Context, event EventPayload) error {
 		record.MediaS3Url = meta.MediaS3Url
 		record.AllowAiTraining = meta.AllowAiTraining
 		record.WebhookUrl = meta.WebhookUrl
+		record.ParentSha256 = meta.ParentSha256
 	} else if err != nil {
 		log.Printf("Pipeline warning: failed to fetch metadata for IPFS CID %s: %v", event.IpfsCid, err)
 	}

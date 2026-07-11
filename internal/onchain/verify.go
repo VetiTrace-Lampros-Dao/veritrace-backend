@@ -2,6 +2,7 @@ package onchain
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"time"
@@ -26,8 +27,23 @@ const contractABI = `[
 		],
 		"name": "ContentRegistered",
 		"type": "event"
+	},
+	{
+		"inputs": [
+			{"name": "sha256hash", "type": "bytes32"}
+		],
+		"name": "verifyContent",
+		"outputs": [
+			{"name": "creator", "type": "address"},
+			{"name": "timestamp", "type": "uint64"},
+			{"name": "phash", "type": "uint64"},
+			{"name": "ipfsCid", "type": "string"},
+			{"name": "aitool", "type": "string"}
+		],
+		"stateMutability": "view",
+		"type": "function"
 	}
-]`
+ ]`
 
 type OnChainRecord struct {
 	Sha256Hash string
@@ -66,53 +82,60 @@ func (v *Verifier) Close() {
 	}
 }
 
-// VerifyHash queries the blockchain for the ContentRegistered event of a specific sha256hash.
 func (v *Verifier) VerifyHash(ctx context.Context, sha256Hex string) (*OnChainRecord, error) {
-	if strings.HasPrefix(sha256Hex, "0x") {
-		sha256Hex = sha256Hex[2:]
+	cleaned := sha256Hex
+	if strings.HasPrefix(cleaned, "0x") {
+		cleaned = cleaned[2:]
 	}
-	hashBytes := common.HexToHash(sha256Hex)
-
-	query := ethereum.FilterQuery{
-		Addresses: []common.Address{v.contractAddr},
-		Topics: [][]common.Hash{
-			{v.parsedABI.Events["ContentRegistered"].ID},
-			{hashBytes},
-		},
+	hashRaw, err := hex.DecodeString(cleaned)
+	if err != nil {
+		return nil, fmt.Errorf("invalid sha256 hex: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	var hashBytes32 [32]byte
+	copy(hashBytes32[:], hashRaw)
+
+	callData, err := v.parsedABI.Pack("verifyContent", hashBytes32)
+	if err != nil {
+		return nil, fmt.Errorf("failed to pack call data: %w", err)
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	
-	logs, err := v.client.FilterLogs(ctx, query)
+
+	result, err := v.client.CallContract(callCtx, ethereum.CallMsg{
+		To:   &v.contractAddr,
+		Data: callData,
+	}, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch logs: %w", err)
+		return nil, nil
 	}
 
-	if len(logs) == 0 {
-		return nil, nil // Not found on chain
+	if len(result) == 0 {
+		return nil, nil
 	}
 
-	lastLog := logs[len(logs)-1]
-
-	var event struct {
-		Phash     uint64
-		Timestamp uint64
-		IpfsCid   string
-		Aitool    string
-	}
-
-	err = v.parsedABI.UnpackIntoInterface(&event, "ContentRegistered", lastLog.Data)
+	outputs, err := v.parsedABI.Unpack("verifyContent", result)
 	if err != nil {
-		return nil, fmt.Errorf("failed to unpack event data: %w", err)
+		return nil, fmt.Errorf("failed to unpack verifyContent response: %w", err)
+	}
+	if len(outputs) < 4 {
+		return nil, fmt.Errorf("unexpected output count from contract: %d", len(outputs))
 	}
 
-	creator := common.BytesToAddress(lastLog.Topics[2].Bytes()).Hex()
+	creator, ok := outputs[0].(common.Address)
+	if !ok {
+		return nil, fmt.Errorf("unexpected type for creator output")
+	}
+	ipfsCid, ok := outputs[3].(string)
+	if !ok {
+		return nil, fmt.Errorf("unexpected type for ipfsCid output")
+	}
 
 	return &OnChainRecord{
 		Sha256Hash: sha256Hex,
-		Creator:    creator,
-		IpfsCid:    event.IpfsCid,
-		TxHash:     lastLog.TxHash.Hex(),
+		Creator:    creator.Hex(),
+		IpfsCid:    ipfsCid,
+		TxHash:     "",
 	}, nil
 }

@@ -13,7 +13,6 @@ import (
 	"log"
 	"mime/multipart"
 	"net/http"
-	"sync"
 	"time"
 
 	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/config"
@@ -74,6 +73,7 @@ type Service interface {
 	PinFile(ctx context.Context, reader io.Reader, filename, contentType string) (string, string, error)
 	GetCheckpoint(ctx context.Context, key string) (uint64, error)
 	SaveCheckpoint(ctx context.Context, key string, val uint64) error
+	GetLineage(ctx context.Context, hash string) ([]*database.ContentRecord, error)
 }
 
 type service struct {
@@ -351,44 +351,35 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 		threshold = 8.0
 	}
 
-	type hit struct{ parentSha256 string }
-	hits := make(chan hit, len(segments))
-	sem := make(chan struct{}, 10)
-	var wg sync.WaitGroup
-
-	for _, seg := range segments {
-		wg.Add(1)
-		go func(kf KeyframePayload) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			vec := phashToVector(kf.PHash)
-			results, err := s.repo.SearchVectorsWithFilter(ctx, vec, 1, pt)
-			if err != nil || len(results) == 0 {
-				return
-			}
-			top := results[0]
-			if float64(top.GetScore()) > threshold {
-				return
-			}
-			payload := top.GetPayload()
-			if payload == nil {
-				return
-			}
-			parentVal, ok := payload["parent_sha256"]
-			if !ok {
-				return
-			}
-			hits <- hit{parentSha256: parentVal.GetStringValue()}
-		}(seg)
+	vecs := make([][]float32, len(segments))
+	for i, seg := range segments {
+		vecs[i] = phashToVector(seg.PHash)
 	}
 
-	wg.Wait()
-	close(hits)
+	batchResults, err := s.repo.SearchVectorsBatch(ctx, vecs, 1, pt)
+	if err != nil {
+		log.Printf("SearchVectorsBatch failed, falling back to no-match: %v", err)
+		return &SegmentVerificationResult{MatchFound: false}, nil
+	}
 
 	matchCounts := make(map[string]int)
-	for h := range hits {
-		matchCounts[h.parentSha256]++
+	for _, results := range batchResults {
+		if len(results) == 0 {
+			continue
+		}
+		top := results[0]
+		if float64(top.GetScore()) > threshold {
+			continue
+		}
+		payload := top.GetPayload()
+		if payload == nil {
+			continue
+		}
+		parentVal, ok := payload["parent_sha256"]
+		if !ok {
+			continue
+		}
+		matchCounts[parentVal.GetStringValue()]++
 	}
 
 	if len(matchCounts) == 0 {
@@ -701,4 +692,8 @@ func (s *service) pinFileToIPFS(ctx context.Context, reader io.Reader, filename 
 	}
 
 	return "", fmt.Errorf("all 3 Pinata IPFS pin attempts failed: %w", lastErr)
+}
+
+func (s *service) GetLineage(ctx context.Context, hash string) ([]*database.ContentRecord, error) {
+	return s.repo.GetLineage(ctx, hash)
 }

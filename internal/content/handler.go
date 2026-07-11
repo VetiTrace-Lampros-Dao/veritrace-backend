@@ -135,3 +135,24 @@ func (h *Handler) VerifySegments(c *gin.Context) {
 
 	c.JSON(http.StatusOK, result)
 }
+
+func (h *Handler) GetLineage(c *gin.Context) {
+	hash := c.Param("hash")
+	if hash == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing hash"})
+		return
+	}
+
+	chain, err := h.service.GetLineage(c.Request.Context(), hash)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if len(chain) == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "no lineage found for this hash"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"lineage": chain, "depth": len(chain)})
+}
