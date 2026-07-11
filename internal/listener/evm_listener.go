@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/big"
 	"strings"
 	"time"
 
 	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/config"
+	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/internal/content"
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
@@ -44,9 +46,10 @@ type EVMListener struct {
 	cfg      *config.Config
 	client   *ethclient.Client
 	eventLog chan EventPayload
+	service  content.Service
 }
 
-func NewEVMListener(cfg *config.Config) (*EVMListener, error) {
+func NewEVMListener(cfg *config.Config, service content.Service) (*EVMListener, error) {
 	client, err := ethclient.Dial(cfg.ArbitrumWS)
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial WebSocket: %w", err)
@@ -56,6 +59,7 @@ func NewEVMListener(cfg *config.Config) (*EVMListener, error) {
 		cfg:      cfg,
 		client:   client,
 		eventLog: make(chan EventPayload, 100),
+		service:  service,
 	}, nil
 }
 
@@ -101,6 +105,64 @@ func (l *EVMListener) Start(ctx context.Context) error {
 					l.client = client
 				}
 
+				// Checkpoint historical catch-up
+				lastBlock, err := l.service.GetCheckpoint(ctx, "evm_listener")
+				if err != nil {
+					log.Printf("EVM Listener: Failed to fetch checkpoint: %v. Using default...", err)
+					lastBlock = 286145000
+				}
+				if lastBlock == 0 {
+					lastBlock = 286145000
+				}
+
+				currentHead, err := l.client.BlockNumber(ctx)
+				if err != nil {
+					log.Printf("EVM Listener: Failed to get current block: %v. Retrying in 5s...", err)
+					time.Sleep(5 * time.Second)
+					continue
+				}
+
+				if lastBlock < currentHead {
+					log.Printf("EVM Listener: Syncing historical events from block %d to %d...", lastBlock+1, currentHead)
+
+					for fromBlock := lastBlock + 1; fromBlock <= currentHead; fromBlock += 5000 {
+						toBlock := fromBlock + 4999
+						if toBlock > currentHead {
+							toBlock = currentHead
+						}
+
+						histQuery := ethereum.FilterQuery{
+							FromBlock: new(big.Int).SetUint64(fromBlock),
+							ToBlock:   new(big.Int).SetUint64(toBlock),
+							Addresses: []common.Address{contractAddr},
+							Topics:    query.Topics,
+						}
+
+						histLogs, err := l.client.FilterLogs(ctx, histQuery)
+						if err != nil {
+							log.Printf("EVM Listener: Failed to fetch historical logs for blocks %d-%d: %v. Reconnecting...", fromBlock, toBlock, err)
+							l.client.Close()
+							l.client = nil
+							time.Sleep(5 * time.Second)
+							break
+						}
+
+						for _, vLog := range histLogs {
+							l.processLog(vLog, parsedABI)
+						}
+
+						if err := l.service.SaveCheckpoint(ctx, "evm_listener", toBlock); err != nil {
+							log.Printf("EVM Listener: Failed to save checkpoint %d: %v", toBlock, err)
+						}
+					}
+
+					if l.client == nil {
+						continue
+					}
+
+					log.Printf("EVM Listener: Historical sync completed up to block %d", currentHead)
+				}
+
 				logsChan := make(chan types.Log)
 				sub, err := l.client.SubscribeFilterLogs(ctx, query, logsChan)
 				if err != nil {
@@ -130,37 +192,9 @@ func (l *EVMListener) Start(ctx context.Context) error {
 						keepRunning = false
 						time.Sleep(2 * time.Second)
 					case vLog := <-logsChan:
-						log.Printf("EVM Listener: Received raw event! Tx: %s, Block: %d, Address: %s", vLog.TxHash.Hex(), vLog.BlockNumber, vLog.Address.Hex())
-						var event struct {
-							Phash     uint64
-							Timestamp uint64
-							IpfsCid   string
-							Aitool    string
-						}
-
-						err := parsedABI.UnpackIntoInterface(&event, "ContentRegistered", vLog.Data)
-						if err != nil {
-							log.Printf("EVM Listener: Failed to unpack event data: %v", err)
-							continue
-						}
-
-						if len(vLog.Topics) < 3 {
-							log.Printf("EVM Listener: Insufficient topics count (%d)", len(vLog.Topics))
-							continue
-						}
-
-						sha256hash := vLog.Topics[1].Hex()
-						creator := common.BytesToAddress(vLog.Topics[2].Bytes()).Hex()
-
-						log.Printf("EVM Listener: Unpacked successfully! Sha256Hash: %s, Creator: %s, PHash: %d, IpfsCid: %s, AiTool: %s", sha256hash, creator, event.Phash, event.IpfsCid, event.Aitool)
-
-						l.eventLog <- EventPayload{
-							Sha256Hash:     sha256hash,
-							CreatorAddress: creator,
-							PHash:          event.Phash,
-							Timestamp:      event.Timestamp,
-							IpfsCid:        event.IpfsCid,
-							AiTool:         event.Aitool,
+						l.processLog(vLog, parsedABI)
+						if err := l.service.SaveCheckpoint(ctx, "evm_listener", vLog.BlockNumber); err != nil {
+							log.Printf("EVM Listener: Failed to save checkpoint %d: %v", vLog.BlockNumber, err)
 						}
 					}
 				}
@@ -169,4 +203,39 @@ func (l *EVMListener) Start(ctx context.Context) error {
 	}()
 
 	return nil
+}
+
+func (l *EVMListener) processLog(vLog types.Log, parsedABI abi.ABI) {
+	log.Printf("EVM Listener: Received raw event! Tx: %s, Block: %d, Address: %s", vLog.TxHash.Hex(), vLog.BlockNumber, vLog.Address.Hex())
+	var event struct {
+		Phash     uint64
+		Timestamp uint64
+		IpfsCid   string
+		Aitool    string
+	}
+
+	err := parsedABI.UnpackIntoInterface(&event, "ContentRegistered", vLog.Data)
+	if err != nil {
+		log.Printf("EVM Listener: Failed to unpack event data: %v", err)
+		return
+	}
+
+	if len(vLog.Topics) < 3 {
+		log.Printf("EVM Listener: Insufficient topics count (%d)", len(vLog.Topics))
+		return
+	}
+
+	sha256hash := vLog.Topics[1].Hex()
+	creator := common.BytesToAddress(vLog.Topics[2].Bytes()).Hex()
+
+	log.Printf("EVM Listener: Unpacked successfully! Sha256Hash: %s, Creator: %s, PHash: %d, IpfsCid: %s, AiTool: %s", sha256hash, creator, event.Phash, event.IpfsCid, event.Aitool)
+
+	l.eventLog <- EventPayload{
+		Sha256Hash:     sha256hash,
+		CreatorAddress: creator,
+		PHash:          event.Phash,
+		Timestamp:      event.Timestamp,
+		IpfsCid:        event.IpfsCid,
+		AiTool:         event.Aitool,
+	}
 }

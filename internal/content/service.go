@@ -38,6 +38,8 @@ type Service interface {
 	VerifyFuzzy(ctx context.Context, phash uint64) (*VerificationResult, error)
 	PinToIPFS(ctx context.Context, payload interface{}) (string, error)
 	PinFile(ctx context.Context, reader io.Reader, filename, contentType string) (string, string, error)
+	GetCheckpoint(ctx context.Context, key string) (uint64, error)
+	SaveCheckpoint(ctx context.Context, key string, val uint64) error
 }
 
 type service struct {
@@ -52,6 +54,14 @@ func NewService(repo Repository, cfg *config.Config, storage StorageProvider) Se
 		cfg:     cfg,
 		storage: storage,
 	}
+}
+
+func (s *service) GetCheckpoint(ctx context.Context, key string) (uint64, error) {
+	return s.repo.GetCheckpoint(ctx, key)
+}
+
+func (s *service) SaveCheckpoint(ctx context.Context, key string, val uint64) error {
+	return s.repo.SaveCheckpoint(ctx, key, val)
 }
 
 func (s *service) Register(ctx context.Context, record database.ContentRecord, keyframes []KeyframePayload, mediaType string) error {

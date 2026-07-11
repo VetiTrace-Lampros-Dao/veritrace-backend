@@ -64,7 +64,7 @@ func main() {
 	contentRepo := content.NewRepository(db, rdb, qdrant)
 	contentService := content.NewService(contentRepo, cfg, storage)
 
-	evmListener, err := listener.NewEVMListener(cfg)
+	evmListener, err := listener.NewEVMListener(cfg, contentService)
 	if err != nil {
 		log.Fatalf("Critical error initializing EVM listener: %v", err)
 	}

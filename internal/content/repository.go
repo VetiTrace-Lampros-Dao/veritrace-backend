@@ -18,6 +18,8 @@ type Repository interface {
 	GetCache(ctx context.Context, hash string) (*database.ContentRecord, error)
 	SaveVectors(ctx context.Context, points []*pb.PointStruct) error
 	SearchVectors(ctx context.Context, vec []float32, limit uint32) ([]*pb.ScoredPoint, error)
+	GetCheckpoint(ctx context.Context, key string) (uint64, error)
+	SaveCheckpoint(ctx context.Context, key string, val uint64) error
 }
 
 type repository struct {
@@ -114,4 +116,23 @@ func (r *repository) SearchVectors(ctx context.Context, vec []float32, limit uin
 		return nil, err
 	}
 	return resp.GetResult(), nil
+}
+
+func (r *repository) GetCheckpoint(ctx context.Context, key string) (uint64, error) {
+	query := `SELECT last_value FROM sync_checkpoints WHERE key = $1;`
+	var val uint64
+	err := r.db.QueryRowContext(ctx, query, key).Scan(&val)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	return val, err
+}
+
+func (r *repository) SaveCheckpoint(ctx context.Context, key string, val uint64) error {
+	query := `
+	INSERT INTO sync_checkpoints (key, last_value)
+	VALUES ($1, $2)
+	ON CONFLICT (key) DO UPDATE SET last_value = EXCLUDED.last_value;`
+	_, err := r.db.ExecContext(ctx, query, key, val)
+	return err
 }
