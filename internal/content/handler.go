@@ -33,6 +33,22 @@ func (h *Handler) VerifyExact(c *gin.Context) {
 	c.JSON(http.StatusOK, result)
 }
 
+func (h *Handler) ExportCertificate(c *gin.Context) {
+	hash := c.Query("hash")
+	if hash == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing hash parameter"})
+		return
+	}
+
+	cert, err := h.service.GenerateCertificate(c.Request.Context(), hash)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, cert)
+}
+
 func (h *Handler) VerifyFuzzy(c *gin.Context) {
 	phashStr := c.Query("phash")
 	if phashStr == "" {

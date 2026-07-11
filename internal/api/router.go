@@ -61,6 +61,7 @@ func SetupRouter(db *sql.DB, rdb *redis.Client, qdrant *vector.QdrantClient, cfg
 	r.GET("/health", healthHandler.CheckHealth)
 
 	r.GET("/api/v1/verify/exact", contentHandler.VerifyExact)
+	r.GET("/api/v1/verify/certificate", contentHandler.ExportCertificate)
 	r.GET("/api/v1/verify/fuzzy", contentHandler.VerifyFuzzy)
 	r.POST("/api/v1/verify/segments", contentHandler.VerifySegments)
 	r.POST("/api/v1/pin", contentHandler.PinToIPFS)

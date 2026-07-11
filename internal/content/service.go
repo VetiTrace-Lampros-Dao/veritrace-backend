@@ -3,8 +3,10 @@ package content
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -50,11 +52,23 @@ type SegmentVerificationResult struct {
 	OnChainTxHash           string                  `json:"on_chain_tx_hash,omitempty"`
 }
 
+type VerificationCertificate struct {
+	CertificateID   string  `json:"certificate_id"`
+	IssuedAt        string  `json:"issued_at"`
+	TargetHash      string  `json:"target_hash"`
+	MatchFound      bool    `json:"match_found"`
+	OriginalCreator string  `json:"original_creator,omitempty"`
+	OnChainTxHash   string  `json:"on_chain_tx_hash,omitempty"`
+	IpfsCid         string  `json:"ipfs_cid,omitempty"`
+	Signature       string  `json:"signature"`
+}
+
 type Service interface {
 	Register(ctx context.Context, record database.ContentRecord, keyframes []KeyframePayload, mediaType string) error
 	VerifyExact(ctx context.Context, hash string) (*VerificationResult, error)
 	VerifyFuzzy(ctx context.Context, phash uint64) (*VerificationResult, error)
 	VerifySegments(ctx context.Context, sha256 string, segments []KeyframePayload, mediaType string) (*SegmentVerificationResult, error)
+	GenerateCertificate(ctx context.Context, hash string) (*VerificationCertificate, error)
 	PinToIPFS(ctx context.Context, payload interface{}) (string, error)
 	PinFile(ctx context.Context, reader io.Reader, filename, contentType string) (string, string, error)
 	GetCheckpoint(ctx context.Context, key string) (uint64, error)
@@ -153,6 +167,34 @@ func (s *service) VerifyExact(ctx context.Context, hash string) (*VerificationRe
 		OnChainVerified: verified,
 		OnChainTxHash:   txHash,
 	}, nil
+}
+
+func (s *service) GenerateCertificate(ctx context.Context, hash string) (*VerificationCertificate, error) {
+	result, err := s.VerifyExact(ctx, hash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to verify record: %w", err)
+	}
+
+	if !result.MatchFound {
+		return nil, fmt.Errorf("no match found for hash %s, cannot generate certificate", hash)
+	}
+
+	cert := &VerificationCertificate{
+		CertificateID:   generateUUID(),
+		IssuedAt:        time.Now().UTC().Format(time.RFC3339),
+		TargetHash:      hash,
+		MatchFound:      true,
+		OriginalCreator: result.Record.CreatorAddress,
+		OnChainTxHash:   result.OnChainTxHash,
+		IpfsCid:         result.Record.IpfsCid,
+	}
+
+	// Sign the certificate contents
+	h := hmac.New(sha256.New, []byte("veritrace-secret-key-2026"))
+	h.Write([]byte(fmt.Sprintf("%s:%s:%s:%s", cert.CertificateID, cert.TargetHash, cert.OriginalCreator, cert.OnChainTxHash)))
+	cert.Signature = hex.EncodeToString(h.Sum(nil))
+
+	return cert, nil
 }
 
 func (s *service) VerifyFuzzy(ctx context.Context, phash uint64) (*VerificationResult, error) {
