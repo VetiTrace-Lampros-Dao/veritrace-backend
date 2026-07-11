@@ -11,10 +11,12 @@ import (
 	"log"
 	"mime/multipart"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/config"
 	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/internal/database"
+	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/internal/onchain"
 	pb "github.com/qdrant/go-client/qdrant"
 )
 
@@ -30,6 +32,8 @@ type VerificationResult struct {
 	TimestampOffset uint64                  `json:"timestamp_offset,omitempty"`
 	MediaType       string                  `json:"media_type,omitempty"`
 	Record          *database.ContentRecord `json:"record,omitempty"`
+	OnChainVerified bool                    `json:"on_chain_verified"`
+	OnChainTxHash   string                  `json:"on_chain_tx_hash,omitempty"`
 }
 
 type SegmentVerificationResult struct {
@@ -42,6 +46,8 @@ type SegmentVerificationResult struct {
 	CoverageUploadedPct     float64                 `json:"coverage_uploaded_pct"`
 	CoverageRegisteredPct   float64                 `json:"coverage_registered_pct"`
 	Record                  *database.ContentRecord `json:"record,omitempty"`
+	OnChainVerified         bool                    `json:"on_chain_verified"`
+	OnChainTxHash           string                  `json:"on_chain_tx_hash,omitempty"`
 }
 
 type Service interface {
@@ -56,16 +62,18 @@ type Service interface {
 }
 
 type service struct {
-	repo    Repository
-	cfg     *config.Config
-	storage StorageProvider
+	repo            Repository
+	cfg             *config.Config
+	storage         StorageProvider
+	onchainVerifier *onchain.Verifier
 }
 
-func NewService(repo Repository, cfg *config.Config, storage StorageProvider) Service {
+func NewService(repo Repository, cfg *config.Config, storage StorageProvider, onchainVerifier *onchain.Verifier) Service {
 	return &service{
-		repo:    repo,
-		cfg:     cfg,
-		storage: storage,
+		repo:            repo,
+		cfg:             cfg,
+		storage:         storage,
+		onchainVerifier: onchainVerifier,
 	}
 }
 
@@ -111,11 +119,14 @@ func (s *service) Register(ctx context.Context, record database.ContentRecord, k
 func (s *service) VerifyExact(ctx context.Context, hash string) (*VerificationResult, error) {
 	cached, err := s.repo.GetCache(ctx, hash)
 	if err == nil && cached != nil {
+		verified, txHash := s.crossCheckBlockchain(ctx, hash, cached.IpfsCid)
 		return &VerificationResult{
-			MatchFound: true,
-			ExactMatch: true,
-			Similarity: 100.0,
-			Record:     cached,
+			MatchFound:      true,
+			ExactMatch:      true,
+			Similarity:      100.0,
+			Record:          cached,
+			OnChainVerified: verified,
+			OnChainTxHash:   txHash,
 		}, nil
 	}
 
@@ -132,11 +143,15 @@ func (s *service) VerifyExact(ctx context.Context, hash string) (*VerificationRe
 
 	_ = s.repo.SaveCache(ctx, *record)
 
+	verified, txHash := s.crossCheckBlockchain(ctx, hash, record.IpfsCid)
+
 	return &VerificationResult{
-		MatchFound: true,
-		ExactMatch: true,
-		Similarity: 100.0,
-		Record:     record,
+		MatchFound:      true,
+		ExactMatch:      true,
+		Similarity:      100.0,
+		Record:          record,
+		OnChainVerified: verified,
+		OnChainTxHash:   txHash,
 	}, nil
 }
 
@@ -211,6 +226,8 @@ func (s *service) VerifyFuzzy(ctx context.Context, phash uint64) (*VerificationR
 
 	similarity := ((64.0 - distance) / 64.0) * 100.0
 
+	verified, txHash := s.crossCheckBlockchain(ctx, recordResult.Record.Sha256Hash, recordResult.Record.IpfsCid)
+
 	return &VerificationResult{
 		MatchFound:      true,
 		ExactMatch:      false,
@@ -218,6 +235,8 @@ func (s *service) VerifyFuzzy(ctx context.Context, phash uint64) (*VerificationR
 		TimestampOffset: offset,
 		MediaType:       mediaType,
 		Record:          recordResult.Record,
+		OnChainVerified: verified,
+		OnChainTxHash:   txHash,
 	}, nil
 
 }
@@ -225,6 +244,11 @@ func (s *service) VerifyFuzzy(ctx context.Context, phash uint64) (*VerificationR
 func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []KeyframePayload, mediaType string) (*SegmentVerificationResult, error) {
 	if len(segments) == 0 {
 		return &SegmentVerificationResult{MatchFound: false}, nil
+	}
+
+	cacheKey := sha256 + ":" + mediaType
+	if cached, err := s.repo.GetSegmentCache(ctx, cacheKey); err == nil && cached != nil {
+		return cached, nil
 	}
 
 	exactResult, err := s.VerifyExact(ctx, sha256)
@@ -240,6 +264,8 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 			CoverageUploadedPct:     100.0,
 			CoverageRegisteredPct:   100.0,
 			Record:                  exactResult.Record,
+			OnChainVerified:         exactResult.OnChainVerified,
+			OnChainTxHash:           exactResult.OnChainTxHash,
 		}, nil
 	}
 
@@ -249,27 +275,44 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 		threshold = 8.0
 	}
 
-	matchCounts := make(map[string]int)
+	type hit struct{ parentSha256 string }
+	hits := make(chan hit, len(segments))
+	sem := make(chan struct{}, 10)
+	var wg sync.WaitGroup
 
 	for _, seg := range segments {
-		vec := phashToVector(seg.PHash)
-		results, err := s.repo.SearchVectorsWithFilter(ctx, vec, 1, pt)
-		if err != nil || len(results) == 0 {
-			continue
-		}
-		top := results[0]
-		if float64(top.GetScore()) > threshold {
-			continue
-		}
-		payload := top.GetPayload()
-		if payload == nil {
-			continue
-		}
-		parentVal, ok := payload["parent_sha256"]
-		if !ok {
-			continue
-		}
-		matchCounts[parentVal.GetStringValue()]++
+		wg.Add(1)
+		go func(kf KeyframePayload) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			vec := phashToVector(kf.PHash)
+			results, err := s.repo.SearchVectorsWithFilter(ctx, vec, 1, pt)
+			if err != nil || len(results) == 0 {
+				return
+			}
+			top := results[0]
+			if float64(top.GetScore()) > threshold {
+				return
+			}
+			payload := top.GetPayload()
+			if payload == nil {
+				return
+			}
+			parentVal, ok := payload["parent_sha256"]
+			if !ok {
+				return
+			}
+			hits <- hit{parentSha256: parentVal.GetStringValue()}
+		}(seg)
+	}
+
+	wg.Wait()
+	close(hits)
+
+	matchCounts := make(map[string]int)
+	for h := range hits {
+		matchCounts[h.parentSha256]++
 	}
 
 	if len(matchCounts) == 0 {
@@ -303,7 +346,9 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 
 	similarity := (coverageUploadedPct + coverageRegisteredPct) / 2.0
 
-	return &SegmentVerificationResult{
+	verified, txHash := s.crossCheckBlockchain(ctx, parentResult.Record.Sha256Hash, parentResult.Record.IpfsCid)
+
+	result := &SegmentVerificationResult{
 		MatchFound:              true,
 		ExactMatch:              false,
 		Similarity:              similarity,
@@ -313,7 +358,13 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 		CoverageUploadedPct:     coverageUploadedPct,
 		CoverageRegisteredPct:   coverageRegisteredPct,
 		Record:                  parentResult.Record,
-	}, nil
+		OnChainVerified:         verified,
+		OnChainTxHash:           txHash,
+	}
+
+	_ = s.repo.SaveSegmentCache(ctx, cacheKey, result)
+
+	return result, nil
 }
 
 func segmentPointType(mediaType string) string {
@@ -321,6 +372,31 @@ func segmentPointType(mediaType string) string {
 		return "keyframe"
 	}
 	return "page"
+}
+
+// crossCheckBlockchain calls the OnChainVerifier to ensure the IPFS CID in our DB matches the one on-chain.
+func (s *service) crossCheckBlockchain(ctx context.Context, sha256Hex, expectedCid string) (bool, string) {
+	if s.onchainVerifier == nil {
+		return false, ""
+	}
+	
+	onChainRec, err := s.onchainVerifier.VerifyHash(ctx, sha256Hex)
+	if err != nil {
+		log.Printf("Blockchain cross-check failed for %s: %v", sha256Hex, err)
+		return false, ""
+	}
+	
+	if onChainRec == nil {
+		log.Printf("Blockchain cross-check failed: %s not found on-chain", sha256Hex)
+		return false, ""
+	}
+	
+	if onChainRec.IpfsCid != expectedCid {
+		log.Printf("Blockchain cross-check failed: CID mismatch for %s. Expected %s, got %s", sha256Hex, expectedCid, onChainRec.IpfsCid)
+		return false, onChainRec.TxHash
+	}
+	
+	return true, onChainRec.TxHash
 }
 
 func (s *service) buildPoint(sha256, creator string, phash, offset uint64, mediaType, pointType string) *pb.PointStruct {

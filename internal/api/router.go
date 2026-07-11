@@ -8,6 +8,7 @@ import (
 	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/config"
 	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/internal/content"
 	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/internal/health"
+	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/internal/onchain"
 	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/internal/vector"
 	"github.com/gin-gonic/gin"
 	pb "github.com/qdrant/go-client/qdrant"
@@ -48,8 +49,13 @@ func SetupRouter(db *sql.DB, rdb *redis.Client, qdrant *vector.QdrantClient, cfg
 		log.Printf("Router warning: failed to initialize storage provider: %v", err)
 	}
 
+	onchainVerifier, err := onchain.NewVerifier(cfg)
+	if err != nil {
+		log.Printf("Router warning: failed to initialize onchain verifier: %v", err)
+	}
+
 	contentRepo := content.NewRepository(db, rdb, qdrant)
-	contentService := content.NewService(contentRepo, cfg, storage)
+	contentService := content.NewService(contentRepo, cfg, storage, onchainVerifier)
 	contentHandler := content.NewHandler(contentService)
 
 	r.GET("/health", healthHandler.CheckHealth)

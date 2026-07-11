@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"time"
 
 	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/internal/database"
 	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/internal/vector"
@@ -20,6 +21,8 @@ type Repository interface {
 	SearchVectors(ctx context.Context, vec []float32, limit uint32) ([]*pb.ScoredPoint, error)
 	SearchVectorsWithFilter(ctx context.Context, vec []float32, limit uint32, pointType string) ([]*pb.ScoredPoint, error)
 	CountSegments(ctx context.Context, parentSha256, pointType string) (int, error)
+	SaveSegmentCache(ctx context.Context, key string, result *SegmentVerificationResult) error
+	GetSegmentCache(ctx context.Context, key string) (*SegmentVerificationResult, error)
 	GetCheckpoint(ctx context.Context, key string) (uint64, error)
 	SaveCheckpoint(ctx context.Context, key string, val uint64) error
 }
@@ -208,4 +211,27 @@ func (r *repository) SaveCheckpoint(ctx context.Context, key string, val uint64)
 	ON CONFLICT (key) DO UPDATE SET last_value = EXCLUDED.last_value;`
 	_, err := r.db.ExecContext(ctx, query, key, val)
 	return err
+}
+
+func (r *repository) SaveSegmentCache(ctx context.Context, key string, result *SegmentVerificationResult) error {
+	data, err := json.Marshal(result)
+	if err != nil {
+		return err
+	}
+	return r.rdb.Set(ctx, "seg:"+key, data, time.Hour).Err()
+}
+
+func (r *repository) GetSegmentCache(ctx context.Context, key string) (*SegmentVerificationResult, error) {
+	val, err := r.rdb.Get(ctx, "seg:"+key).Result()
+	if err == redis.Nil {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var result SegmentVerificationResult
+	if err := json.Unmarshal([]byte(val), &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
 }

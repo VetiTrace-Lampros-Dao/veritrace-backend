@@ -9,6 +9,7 @@ import (
 	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/internal/content"
 	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/internal/database"
 	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/internal/listener"
+	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/internal/onchain"
 	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/internal/vector"
 )
 
@@ -61,8 +62,14 @@ func main() {
 		log.Printf("Server warning: failed to initialize storage provider: %v", err)
 	}
 
+	onchainVerifier, err := onchain.NewVerifier(cfg)
+	if err != nil {
+		log.Fatalf("Critical error initializing OnChain verifier: %v", err)
+	}
+	defer onchainVerifier.Close()
+
 	contentRepo := content.NewRepository(db, rdb, qdrant)
-	contentService := content.NewService(contentRepo, cfg, storage)
+	contentService := content.NewService(contentRepo, cfg, storage, onchainVerifier)
 
 	evmListener, err := listener.NewEVMListener(cfg, contentService)
 	if err != nil {
