@@ -74,12 +74,12 @@ func InitQdrant(cfg *config.Config) (*QdrantClient, error) {
 
 	_, err = pointsClient.CreateFieldIndex(ctx, &pb.CreateFieldIndexCollection{
 		CollectionName: "veritrace_signatures",
-		FieldName:      "media_type",
+		FieldName:      "point_type",
 		FieldType:      pb.FieldType_FieldTypeKeyword.Enum(),
 	})
 	if err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("failed to create field index media_type: %w", err)
+		return nil, fmt.Errorf("failed to create field index point_type: %w", err)
 	}
 
 	return &QdrantClient{

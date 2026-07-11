@@ -105,14 +105,10 @@ func (l *EVMListener) Start(ctx context.Context) error {
 					l.client = client
 				}
 
-				// Checkpoint historical catch-up
 				lastBlock, err := l.service.GetCheckpoint(ctx, "evm_listener")
 				if err != nil {
-					log.Printf("EVM Listener: Failed to fetch checkpoint: %v. Using default...", err)
-					lastBlock = 286145000
-				}
-				if lastBlock == 0 {
-					lastBlock = 286145000
+					log.Printf("EVM Listener: Failed to fetch checkpoint: %v. Using current head...", err)
+					lastBlock = 0
 				}
 
 				currentHead, err := l.client.BlockNumber(ctx)
@@ -122,11 +118,30 @@ func (l *EVMListener) Start(ctx context.Context) error {
 					continue
 				}
 
+				if lastBlock == 0 {
+					log.Printf("EVM Listener: No checkpoint found, initializing to current block %d", currentHead)
+					lastBlock = currentHead
+					if err := l.service.SaveCheckpoint(ctx, "evm_listener", currentHead); err != nil {
+						log.Printf("EVM Listener: Failed to initialize checkpoint: %v", err)
+					}
+				}
+
+				if lastBlock < currentHead {
+					gap := currentHead - lastBlock
+					if gap > 100 {
+						log.Printf("EVM Listener: Warning: checkpoint is too far behind current head (%d blocks). Resetting checkpoint to %d to avoid rate limits.", gap, currentHead)
+						if err := l.service.SaveCheckpoint(ctx, "evm_listener", currentHead); err != nil {
+							log.Printf("EVM Listener: Failed to save checkpoint %d: %v", currentHead, err)
+						}
+						lastBlock = currentHead
+					}
+				}
+
 				if lastBlock < currentHead {
 					log.Printf("EVM Listener: Syncing historical events from block %d to %d...", lastBlock+1, currentHead)
 
-					for fromBlock := lastBlock + 1; fromBlock <= currentHead; fromBlock += 5000 {
-						toBlock := fromBlock + 4999
+					for fromBlock := lastBlock + 1; fromBlock <= currentHead; fromBlock += 10 {
+						toBlock := fromBlock + 9
 						if toBlock > currentHead {
 							toBlock = currentHead
 						}

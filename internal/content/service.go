@@ -32,10 +32,23 @@ type VerificationResult struct {
 	Record          *database.ContentRecord `json:"record,omitempty"`
 }
 
+type SegmentVerificationResult struct {
+	MatchFound              bool                    `json:"match_found"`
+	ExactMatch              bool                    `json:"exact_match"`
+	Similarity              float64                 `json:"similarity"`
+	MatchedSegments         int                     `json:"matched_segments"`
+	TotalSegmentsUploaded   int                     `json:"total_segments_uploaded"`
+	TotalSegmentsRegistered int                     `json:"total_segments_registered"`
+	CoverageUploadedPct     float64                 `json:"coverage_uploaded_pct"`
+	CoverageRegisteredPct   float64                 `json:"coverage_registered_pct"`
+	Record                  *database.ContentRecord `json:"record,omitempty"`
+}
+
 type Service interface {
 	Register(ctx context.Context, record database.ContentRecord, keyframes []KeyframePayload, mediaType string) error
 	VerifyExact(ctx context.Context, hash string) (*VerificationResult, error)
 	VerifyFuzzy(ctx context.Context, phash uint64) (*VerificationResult, error)
+	VerifySegments(ctx context.Context, sha256 string, segments []KeyframePayload, mediaType string) (*SegmentVerificationResult, error)
 	PinToIPFS(ctx context.Context, payload interface{}) (string, error)
 	PinFile(ctx context.Context, reader io.Reader, filename, contentType string) (string, string, error)
 	GetCheckpoint(ctx context.Context, key string) (uint64, error)
@@ -74,12 +87,18 @@ func (s *service) Register(ctx context.Context, record database.ContentRecord, k
 	}
 
 	var points []*pb.PointStruct
-	if len(keyframes) > 0 {
+
+	if mediaType == "document" {
+		points = append(points, s.buildPoint(record.Sha256Hash, record.CreatorAddress, record.PHash, 0, mediaType, "document"))
 		for _, kf := range keyframes {
-			points = append(points, s.buildPoint(record.Sha256Hash, record.CreatorAddress, kf.PHash, kf.Offset, mediaType))
+			points = append(points, s.buildPoint(record.Sha256Hash, record.CreatorAddress, kf.PHash, kf.Offset, mediaType, "page"))
+		}
+	} else if mediaType == "video" && len(keyframes) > 0 {
+		for _, kf := range keyframes {
+			points = append(points, s.buildPoint(record.Sha256Hash, record.CreatorAddress, kf.PHash, kf.Offset, mediaType, "keyframe"))
 		}
 	} else {
-		points = append(points, s.buildPoint(record.Sha256Hash, record.CreatorAddress, record.PHash, 0, mediaType))
+		points = append(points, s.buildPoint(record.Sha256Hash, record.CreatorAddress, record.PHash, 0, mediaType, "image"))
 	}
 
 	if err := s.repo.SaveVectors(ctx, points); err != nil {
@@ -137,7 +156,20 @@ func (s *service) VerifyFuzzy(ctx context.Context, phash uint64) (*VerificationR
 	match := matches[0]
 	distance := float64(match.GetScore())
 
-	if distance > 10.0 {
+	payloadEarly := match.GetPayload()
+	matchedMediaType := ""
+	if payloadEarly != nil {
+		if mtv, ok := payloadEarly["media_type"]; ok {
+			matchedMediaType = mtv.GetStringValue()
+		}
+	}
+
+	threshold := 10.0
+	if matchedMediaType == "document" {
+		threshold = 3.0
+	}
+
+	if distance > threshold {
 		return &VerificationResult{
 			MatchFound: false,
 		}, nil
@@ -190,7 +222,108 @@ func (s *service) VerifyFuzzy(ctx context.Context, phash uint64) (*VerificationR
 
 }
 
-func (s *service) buildPoint(sha256, creator string, phash, offset uint64, mediaType string) *pb.PointStruct {
+func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []KeyframePayload, mediaType string) (*SegmentVerificationResult, error) {
+	if len(segments) == 0 {
+		return &SegmentVerificationResult{MatchFound: false}, nil
+	}
+
+	exactResult, err := s.VerifyExact(ctx, sha256)
+	if err == nil && exactResult.MatchFound {
+		totalRegistered, _ := s.repo.CountSegments(ctx, sha256, segmentPointType(mediaType))
+		return &SegmentVerificationResult{
+			MatchFound:              true,
+			ExactMatch:              true,
+			Similarity:              100.0,
+			MatchedSegments:         len(segments),
+			TotalSegmentsUploaded:   len(segments),
+			TotalSegmentsRegistered: totalRegistered,
+			CoverageUploadedPct:     100.0,
+			CoverageRegisteredPct:   100.0,
+			Record:                  exactResult.Record,
+		}, nil
+	}
+
+	pt := segmentPointType(mediaType)
+	threshold := 5.0
+	if mediaType == "video" {
+		threshold = 8.0
+	}
+
+	matchCounts := make(map[string]int)
+
+	for _, seg := range segments {
+		vec := phashToVector(seg.PHash)
+		results, err := s.repo.SearchVectorsWithFilter(ctx, vec, 1, pt)
+		if err != nil || len(results) == 0 {
+			continue
+		}
+		top := results[0]
+		if float64(top.GetScore()) > threshold {
+			continue
+		}
+		payload := top.GetPayload()
+		if payload == nil {
+			continue
+		}
+		parentVal, ok := payload["parent_sha256"]
+		if !ok {
+			continue
+		}
+		matchCounts[parentVal.GetStringValue()]++
+	}
+
+	if len(matchCounts) == 0 {
+		return &SegmentVerificationResult{MatchFound: false}, nil
+	}
+
+	bestParent := ""
+	bestCount := 0
+	for parent, count := range matchCounts {
+		if count > bestCount {
+			bestCount = count
+			bestParent = parent
+		}
+	}
+
+	coverageUploadedPct := float64(bestCount) / float64(len(segments)) * 100.0
+	if coverageUploadedPct < 5.0 {
+		return &SegmentVerificationResult{MatchFound: false}, nil
+	}
+
+	parentResult, err := s.VerifyExact(ctx, bestParent)
+	if err != nil || !parentResult.MatchFound {
+		return &SegmentVerificationResult{MatchFound: false}, nil
+	}
+
+	totalRegistered, _ := s.repo.CountSegments(ctx, bestParent, pt)
+	coverageRegisteredPct := 0.0
+	if totalRegistered > 0 {
+		coverageRegisteredPct = float64(bestCount) / float64(totalRegistered) * 100.0
+	}
+
+	similarity := (coverageUploadedPct + coverageRegisteredPct) / 2.0
+
+	return &SegmentVerificationResult{
+		MatchFound:              true,
+		ExactMatch:              false,
+		Similarity:              similarity,
+		MatchedSegments:         bestCount,
+		TotalSegmentsUploaded:   len(segments),
+		TotalSegmentsRegistered: totalRegistered,
+		CoverageUploadedPct:     coverageUploadedPct,
+		CoverageRegisteredPct:   coverageRegisteredPct,
+		Record:                  parentResult.Record,
+	}, nil
+}
+
+func segmentPointType(mediaType string) string {
+	if mediaType == "video" {
+		return "keyframe"
+	}
+	return "page"
+}
+
+func (s *service) buildPoint(sha256, creator string, phash, offset uint64, mediaType, pointType string) *pb.PointStruct {
 	uuidStr := generateUUID()
 	vec := phashToVector(phash)
 
@@ -199,6 +332,7 @@ func (s *service) buildPoint(sha256, creator string, phash, offset uint64, media
 		"creator_address":  pb.NewValueString(creator),
 		"timestamp_offset": pb.NewValueInt(int64(offset)),
 		"media_type":       pb.NewValueString(mediaType),
+		"point_type":       pb.NewValueString(pointType),
 	}
 
 	return &pb.PointStruct{

@@ -10,6 +10,7 @@ import (
 	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/internal/health"
 	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/internal/vector"
 	"github.com/gin-gonic/gin"
+	pb "github.com/qdrant/go-client/qdrant"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -55,8 +56,55 @@ func SetupRouter(db *sql.DB, rdb *redis.Client, qdrant *vector.QdrantClient, cfg
 
 	r.GET("/api/v1/verify/exact", contentHandler.VerifyExact)
 	r.GET("/api/v1/verify/fuzzy", contentHandler.VerifyFuzzy)
+	r.POST("/api/v1/verify/segments", contentHandler.VerifySegments)
 	r.POST("/api/v1/pin", contentHandler.PinToIPFS)
 	r.POST("/api/v1/pin-file", contentHandler.PinFile)
+
+	r.POST("/api/v1/dev/flush", func(c *gin.Context) {
+		_, err := db.Exec("TRUNCATE TABLE content_records, sync_checkpoints RESTART IDENTITY;")
+		if err != nil {
+			c.JSON(500, gin.H{"error": "failed to truncate postgres: " + err.Error()})
+			return
+		}
+
+		err = rdb.FlushAll(c.Request.Context()).Err()
+		if err != nil {
+			c.JSON(500, gin.H{"error": "failed to flush redis: " + err.Error()})
+			return
+		}
+
+		_, err = qdrant.Points.Delete(c.Request.Context(), &pb.DeletePoints{
+			CollectionName: "veritrace_signatures",
+			Points: &pb.PointsSelector{
+				PointsSelectorOneOf: &pb.PointsSelector_Filter{
+					Filter: &pb.Filter{},
+				},
+			},
+		})
+		if err != nil {
+			log.Printf("Dev Flush: Points delete failed (%v), recreating collection...", err)
+			_, _ = qdrant.Collections.Delete(c.Request.Context(), &pb.DeleteCollection{
+				CollectionName: "veritrace_signatures",
+			})
+			_, err = qdrant.Collections.Create(c.Request.Context(), &pb.CreateCollection{
+				CollectionName: "veritrace_signatures",
+				VectorsConfig: &pb.VectorsConfig{
+					Config: &pb.VectorsConfig_Params{
+						Params: &pb.VectorParams{
+							Size:     64,
+							Distance: pb.Distance_Manhattan,
+						},
+					},
+				},
+			})
+			if err != nil {
+				c.JSON(500, gin.H{"error": "failed to recreate qdrant collection: " + err.Error()})
+				return
+			}
+		}
+
+		c.JSON(200, gin.H{"status": "success", "message": "all data successfully flushed"})
+	})
 
 	return r
 }

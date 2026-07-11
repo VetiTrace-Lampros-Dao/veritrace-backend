@@ -18,6 +18,8 @@ type Repository interface {
 	GetCache(ctx context.Context, hash string) (*database.ContentRecord, error)
 	SaveVectors(ctx context.Context, points []*pb.PointStruct) error
 	SearchVectors(ctx context.Context, vec []float32, limit uint32) ([]*pb.ScoredPoint, error)
+	SearchVectorsWithFilter(ctx context.Context, vec []float32, limit uint32, pointType string) ([]*pb.ScoredPoint, error)
+	CountSegments(ctx context.Context, parentSha256, pointType string) (int, error)
 	GetCheckpoint(ctx context.Context, key string) (uint64, error)
 	SaveCheckpoint(ctx context.Context, key string, val uint64) error
 }
@@ -116,6 +118,77 @@ func (r *repository) SearchVectors(ctx context.Context, vec []float32, limit uin
 		return nil, err
 	}
 	return resp.GetResult(), nil
+}
+
+func (r *repository) SearchVectorsWithFilter(ctx context.Context, vec []float32, limit uint32, pointType string) ([]*pb.ScoredPoint, error) {
+	resp, err := r.qdrant.Points.Search(ctx, &pb.SearchPoints{
+		CollectionName: "veritrace_signatures",
+		Vector:         vec,
+		Limit:          uint64(limit),
+		WithPayload: &pb.WithPayloadSelector{
+			SelectorOptions: &pb.WithPayloadSelector_Enable{
+				Enable: true,
+			},
+		},
+		Filter: &pb.Filter{
+			Must: []*pb.Condition{
+				{
+					ConditionOneOf: &pb.Condition_Field{
+						Field: &pb.FieldCondition{
+							Key: "point_type",
+							Match: &pb.Match{
+								MatchValue: &pb.Match_Keyword{
+									Keyword: pointType,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp.GetResult(), nil
+}
+
+func (r *repository) CountSegments(ctx context.Context, parentSha256, pointType string) (int, error) {
+	resp, err := r.qdrant.Points.Count(ctx, &pb.CountPoints{
+		CollectionName: "veritrace_signatures",
+		Filter: &pb.Filter{
+			Must: []*pb.Condition{
+				{
+					ConditionOneOf: &pb.Condition_Field{
+						Field: &pb.FieldCondition{
+							Key: "parent_sha256",
+							Match: &pb.Match{
+								MatchValue: &pb.Match_Keyword{
+									Keyword: parentSha256,
+								},
+							},
+						},
+					},
+				},
+				{
+					ConditionOneOf: &pb.Condition_Field{
+						Field: &pb.FieldCondition{
+							Key: "point_type",
+							Match: &pb.Match{
+								MatchValue: &pb.Match_Keyword{
+									Keyword: pointType,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return 0, err
+	}
+	return int(resp.GetResult().GetCount()), nil
 }
 
 func (r *repository) GetCheckpoint(ctx context.Context, key string) (uint64, error) {

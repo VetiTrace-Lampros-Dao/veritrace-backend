@@ -96,5 +96,26 @@ func (h *Handler) PinFile(c *gin.Context) {
 		"media_s3_url":   s3Url,
 	})
 }
+func (h *Handler) VerifySegments(c *gin.Context) {
+	var req struct {
+		SHA256    string           `json:"sha256"`
+		MediaType string           `json:"media_type"`
+		Segments  []KeyframePayload `json:"segments"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body: " + err.Error()})
+		return
+	}
+	if req.SHA256 == "" || req.MediaType == "" || len(req.Segments) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "sha256, media_type, and segments are required"})
+		return
+	}
 
+	result, err := h.service.VerifySegments(c.Request.Context(), req.SHA256, req.Segments, req.MediaType)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 
+	c.JSON(http.StatusOK, result)
+}
