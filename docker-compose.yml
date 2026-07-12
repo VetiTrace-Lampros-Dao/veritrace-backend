@@ -66,6 +66,7 @@ services:
       - S3_SECRET_KEY=minioadmin
       - S3_BUCKET=veritrace
       - S3_REGION=us-east-1
+      - UPLOAD_BASE_URL=${UPLOAD_BASE_URL}
 
   minio:
     image: minio/minio:latest
