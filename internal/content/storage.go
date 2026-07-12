@@ -153,5 +153,5 @@ func InitStorageProvider(ctx context.Context, cfg *config.Config) (StorageProvid
 		return provider, nil
 	}
 
-	return NewLocalStorageProvider("./uploads", "http://localhost:8080/uploads"), nil
+	return NewLocalStorageProvider("./uploads", cfg.UploadBaseURL), nil
 }

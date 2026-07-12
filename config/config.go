@@ -31,6 +31,7 @@ type Config struct {
 	S3SecretKey     string
 	S3Bucket        string
 	S3Region        string
+	UploadBaseURL   string
 }
 
 func LoadConfig() *Config {
@@ -71,6 +72,7 @@ func LoadConfig() *Config {
 		S3SecretKey:     getEnv("S3_SECRET_KEY", ""),
 		S3Bucket:        getEnv("S3_BUCKET", "veritrace"),
 		S3Region:        getEnv("S3_REGION", "us-east-1"),
+		UploadBaseURL:   getEnv("UPLOAD_BASE_URL", "http://localhost:8080/uploads"),
 	}
 }
 
