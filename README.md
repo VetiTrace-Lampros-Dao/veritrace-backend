@@ -168,7 +168,7 @@ The Go application automatically waits for the PostgreSQL database container to 
 Once the containers are running, query the health check endpoint:
 
 ```bash
-curl http://localhost:8080/health
+curl https://api.veritrace.dpkvtrading.online/health
 ```
 
 Expected Response:
@@ -190,7 +190,7 @@ Expected Response:
   * `hash`: The SHA-256 hash of the media file (e.g., `0x6ca0...`).
 * **Example Query**:
   ```bash
-  curl "http://localhost:8080/api/v1/verify/exact?hash=0x6ca0f85e3618e276dffd6d4ea07f14e35570c3b1d041e1378b074aa0054e5d18"
+  curl "https://api.veritrace.dpkvtrading.online/api/v1/verify/exact?hash=0x6ca0f85e3618e276dffd6d4ea07f14e35570c3b1d041e1378b074aa0054e5d18"
   ```
 * **Example Response**:
   ```json
@@ -217,7 +217,7 @@ Expected Response:
   * `phash`: The 64-bit integer visual perceptual hash of the file.
 * **Example Query**:
   ```bash
-  curl "http://localhost:8080/api/v1/verify/fuzzy?phash=9876543210123"
+  curl "https://api.veritrace.dpkvtrading.online/api/v1/verify/fuzzy?phash=9876543210123"
   ```
 * **Example Response**:
   ```json
@@ -236,3 +236,92 @@ Expected Response:
     }
   }
   ```
+
+---
+
+### 3. Segmented Match Verification (Videos & Documents)
+* **Endpoint**: `POST /api/v1/verify/segments`
+* **Content-Type**: `application/json`
+* **Request Body**:
+  ```json
+  {
+    "sha256": "0x123...",
+    "media_type": "video",
+    "segments": [
+      { "offset": 1, "phash": 567890123 }
+    ]
+  }
+  ```
+* **Example Response**:
+  ```json
+  {
+    "match_found": true,
+    "exact_match": false,
+    "similarity": 88.5,
+    "matched_segments": 42,
+    "record": { ... }
+  }
+  ```
+
+---
+
+### 4. IPFS Pinning Endpoints
+* **`POST /api/v1/pin-file`**: Uploads and pins a raw media file (using `multipart/form-data` with `file`). Returns `{"ipfs_cid": "Qm..."}`.
+* **`POST /api/v1/pin`**: Uploads and pins a JSON metadata payload (using `application/json`). Returns `{"ipfs_cid": "Qm..."}`.
+
+---
+
+### 5. Utilities
+* **`GET /api/v1/verify/certificate?hash=0x...`**: Exports a verifiable JSON certificate of registration.
+* **`GET /api/v1/content/:hash/lineage`**: Retrieves the tree of all known derivative versions stemming from an original parent asset.
+
+---
+
+## Hashing Service API (Port: 8081)
+
+### Extract Signatures
+* **Endpoint**: `POST /api/v1/hash`
+* **Content-Type**: `multipart/form-data`
+* **Request**: Upload the media file in the `file` field.
+* **Response (Images)**:
+  ```json
+  {
+    "sha256": "0x123...",
+    "phash": 1234567890,
+    "media_type": "image"
+  }
+  ```
+* **Response (Videos/Documents)**:
+  ```json
+  {
+    "sha256": "0x123...",
+    "phash": 0,
+    "media_type": "video",
+    "keyframes": [
+      { "offset": 1, "phash": 567890123 }
+    ]
+  }
+  ```
+
+---
+
+## Frontend Integration Flow
+
+> **Production Base URLs:**
+> * **Hashing Service:** `https://api.hash.veritrace.dpkvtrading.online`
+> * **Core API Backend:** `https://api.veritrace.dpkvtrading.online`
+
+### A. Asset Registration Flow
+1. **Extract Signatures**: `POST https://api.hash.veritrace.dpkvtrading.online/api/v1/hash` to get `sha256`, `phash`, and `keyframes`.
+2. **Pin Media to IPFS**: `POST https://api.veritrace.dpkvtrading.online/api/v1/pin-file` to get the media's `ipfs_cid`.
+3. **Pin Metadata**: Construct metadata JSON and `POST https://api.veritrace.dpkvtrading.online/api/v1/pin`.
+4. **On-Chain Transaction**: Prompt wallet to execute `registerContent` on the smart contract.
+5. **Wait for Confirmation**: Frontend waits for transaction receipt.
+
+### B. Asset Verification Flow
+1. **Extract Signatures**: `POST https://api.hash.veritrace.dpkvtrading.online/api/v1/hash` with the query file.
+2. **Check Exact Match**: `GET https://api.veritrace.dpkvtrading.online/api/v1/verify/exact?hash={sha256}`.
+3. **Fallback to Fuzzy/Segmented Match**:
+   * **Single images**: `GET https://api.veritrace.dpkvtrading.online/api/v1/verify/fuzzy?phash={phash}`.
+   * **Videos/Documents**: `POST https://api.veritrace.dpkvtrading.online/api/v1/verify/segments` with extracted keyframes.
+4. **Display Results**: Receive response and display **Exact Match**, **Derivative Match** (with similarity %), or **Unregistered Asset**.
