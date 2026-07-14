@@ -237,18 +237,7 @@ func (s *service) VerifyFuzzy(ctx context.Context, phash uint64) (*VerificationR
 	match := matches[0]
 	distance := float64(match.GetScore())
 
-	payloadEarly := match.GetPayload()
-	matchedMediaType := ""
-	if payloadEarly != nil {
-		if mtv, ok := payloadEarly["media_type"]; ok {
-			matchedMediaType = mtv.GetStringValue()
-		}
-	}
-
-	threshold := 10.0
-	if matchedMediaType == "document" {
-		threshold = 3.0
-	}
+	threshold := 22.0
 
 	if distance > threshold {
 		return &VerificationResult{
@@ -346,10 +335,7 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 	}
 
 	pt := segmentPointType(mediaType)
-	threshold := 5.0
-	if mediaType == "video" {
-		threshold = 8.0
-	}
+	threshold := 22.0
 
 	vecs := make([][]float32, len(segments))
 	for i, seg := range segments {
