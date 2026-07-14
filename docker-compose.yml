@@ -1,11 +1,9 @@
 services:
   db:
     image: postgres:15-alpine
-    ports:
-      - "5432:5432"
     environment:
       - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_PASSWORD=qN8#L2x!R9v@M4kP7sD1
       - POSTGRES_DB=veritrace
     volumes:
       - postgres_data:/var/lib/postgresql/data
@@ -48,7 +46,7 @@ services:
       - DB_HOST=db
       - DB_PORT=5432
       - DB_USER=postgres
-      - DB_PASSWORD=postgres
+      - DB_PASSWORD=qN8#L2x!R9v@M4kP7sD1
       - DB_NAME=veritrace
       - DB_SSLMODE=disable
       - REDIS_HOST=redis
