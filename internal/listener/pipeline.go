@@ -117,31 +117,48 @@ func (p *Pipeline) fetchMetadata(ctx context.Context, ipfsCid string) (*Metadata
 		return nil, fmt.Errorf("empty IPFS CID")
 	}
 
-	url := fmt.Sprintf("https://ipfs.io/ipfs/%s", ipfsCid)
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return nil, err
+	gateways := []string{
+		"https://gateway.pinata.cloud/ipfs/%s",
+		"https://cloudflare-ipfs.com/ipfs/%s",
+		"https://ipfs.io/ipfs/%s",
 	}
 
 	client := http.Client{
-		Timeout: 5 * time.Second,
+		Timeout: 10 * time.Second,
 	}
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+	var lastErr error
+	for _, gw := range gateways {
+		url := fmt.Sprintf(gw, ipfsCid)
+		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP status %d", resp.StatusCode)
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			lastErr = fmt.Errorf("HTTP status %d on %s", resp.StatusCode, gw)
+			continue
+		}
+
+		var meta MetadataJSON
+		if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
+			resp.Body.Close()
+			lastErr = err
+			continue
+		}
+		resp.Body.Close()
+
+		return &meta, nil
 	}
 
-	var meta MetadataJSON
-	if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
-		return nil, err
-	}
-
-	return &meta, nil
+	return nil, fmt.Errorf("all gateways failed. last error: %v", lastErr)
 }
 
