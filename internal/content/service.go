@@ -23,8 +23,9 @@ import (
 )
 
 type KeyframePayload struct {
-	Offset uint64 `json:"offset"`
-	PHash  uint64 `json:"phash"`
+	Offset       uint64    `json:"offset"`
+	PHash        uint64    `json:"phash"`
+	SemanticHash []float32 `json:"semantic_hash,omitempty"`
 }
 
 type VerificationResult struct {
@@ -50,6 +51,7 @@ type SegmentVerificationResult struct {
 	Record                  *database.ContentRecord `json:"record,omitempty"`
 	OnChainVerified         bool                    `json:"on_chain_verified"`
 	OnChainTxHash           string                  `json:"on_chain_tx_hash,omitempty"`
+	IsDeepfake              bool                    `json:"is_deepfake"`
 }
 
 type VerificationCertificate struct {
@@ -64,7 +66,7 @@ type VerificationCertificate struct {
 }
 
 type Service interface {
-	Register(ctx context.Context, record database.ContentRecord, keyframes []KeyframePayload, mediaType string) error
+	Register(ctx context.Context, record database.ContentRecord, keyframes []KeyframePayload, mediaType string, rootSemanticHash []float32) error
 	VerifyExact(ctx context.Context, hash string) (*VerificationResult, error)
 	VerifyFuzzy(ctx context.Context, phash uint64) (*VerificationResult, error)
 	VerifySegments(ctx context.Context, sha256 string, segments []KeyframePayload, mediaType string) (*SegmentVerificationResult, error)
@@ -102,7 +104,7 @@ func (s *service) SaveCheckpoint(ctx context.Context, key string, val uint64) er
 	return s.repo.SaveCheckpoint(ctx, key, val)
 }
 
-func (s *service) Register(ctx context.Context, record database.ContentRecord, keyframes []KeyframePayload, mediaType string) error {
+func (s *service) Register(ctx context.Context, record database.ContentRecord, keyframes []KeyframePayload, mediaType string, rootSemanticHash []float32) error {
 	if err := s.repo.SavePostgres(ctx, record); err != nil {
 		return fmt.Errorf("failed to save to postgres: %w", err)
 	}
@@ -112,22 +114,38 @@ func (s *service) Register(ctx context.Context, record database.ContentRecord, k
 	}
 
 	var points []*pb.PointStruct
+	var semPoints []*pb.PointStruct
 
 	if mediaType == "document" {
 		points = append(points, s.buildPoint(record.Sha256Hash, record.CreatorAddress, record.PHash, 0, mediaType, "document"))
+		if sp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, rootSemanticHash, 0, mediaType, "document"); sp != nil {
+			semPoints = append(semPoints, sp)
+		}
 		for _, kf := range keyframes {
 			points = append(points, s.buildPoint(record.Sha256Hash, record.CreatorAddress, kf.PHash, kf.Offset, mediaType, "page"))
+			if sp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, kf.SemanticHash, kf.Offset, mediaType, "page"); sp != nil {
+				semPoints = append(semPoints, sp)
+			}
 		}
 	} else if mediaType == "video" && len(keyframes) > 0 {
 		for _, kf := range keyframes {
 			points = append(points, s.buildPoint(record.Sha256Hash, record.CreatorAddress, kf.PHash, kf.Offset, mediaType, "keyframe"))
+			if sp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, kf.SemanticHash, kf.Offset, mediaType, "keyframe"); sp != nil {
+				semPoints = append(semPoints, sp)
+			}
 		}
 	} else {
 		points = append(points, s.buildPoint(record.Sha256Hash, record.CreatorAddress, record.PHash, 0, mediaType, "image"))
+		if sp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, rootSemanticHash, 0, mediaType, "image"); sp != nil {
+			semPoints = append(semPoints, sp)
+		}
 	}
 
 	if err := s.repo.SaveVectors(ctx, points); err != nil {
 		return fmt.Errorf("failed to index vectors: %w", err)
+	}
+	if err := s.repo.SaveSemanticVectors(ctx, semPoints); err != nil {
+		return fmt.Errorf("failed to index semantic vectors: %w", err)
 	}
 
 	return nil
@@ -336,16 +354,23 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 
 	pt := segmentPointType(mediaType)
 	threshold := 22.0
+	semanticThreshold := 0.85
 
 	vecs := make([][]float32, len(segments))
+	semVecs := make([][]float32, len(segments))
 	for i, seg := range segments {
 		vecs[i] = phashToVector(seg.PHash)
+		semVecs[i] = seg.SemanticHash
 	}
 
 	batchResults, err := s.repo.SearchVectorsBatch(ctx, vecs, 1, pt)
 	if err != nil {
-		log.Printf("SearchVectorsBatch failed, falling back to no-match: %v", err)
-		return &SegmentVerificationResult{MatchFound: false}, nil
+		log.Printf("SearchVectorsBatch failed: %v", err)
+	}
+
+	semBatchResults, err := s.repo.SearchSemanticVectorsBatch(ctx, semVecs, 1, pt)
+	if err != nil {
+		log.Printf("SearchSemanticVectorsBatch failed: %v", err)
 	}
 
 	matchCounts := make(map[string]int)
@@ -362,14 +387,28 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 			continue
 		}
 		parentVal, ok := payload["parent_sha256"]
-		if !ok {
-			continue
+		if ok {
+			matchCounts[parentVal.GetStringValue()]++
 		}
-		matchCounts[parentVal.GetStringValue()]++
 	}
 
-	if len(matchCounts) == 0 {
-		return &SegmentVerificationResult{MatchFound: false}, nil
+	semMatchCounts := make(map[string]int)
+	for _, results := range semBatchResults {
+		if len(results) == 0 {
+			continue
+		}
+		top := results[0]
+		if float64(top.GetScore()) < semanticThreshold {
+			continue
+		}
+		payload := top.GetPayload()
+		if payload == nil {
+			continue
+		}
+		parentVal, ok := payload["parent_sha256"]
+		if ok {
+			semMatchCounts[parentVal.GetStringValue()]++
+		}
 	}
 
 	bestParent := ""
@@ -381,33 +420,69 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 		}
 	}
 
-	coverageUploadedPct := float64(bestCount) / float64(len(segments)) * 100.0
-	if coverageUploadedPct < 5.0 {
+	bestSemParent := ""
+	bestSemCount := 0
+	for parent, count := range semMatchCounts {
+		if count > bestSemCount {
+			bestSemCount = count
+			bestSemParent = parent
+		}
+	}
+
+	coverageUploadedPct := 0.0
+	if len(segments) > 0 {
+		coverageUploadedPct = float64(bestCount) / float64(len(segments)) * 100.0
+	}
+
+	semCoverageUploadedPct := 0.0
+	if len(segments) > 0 {
+		semCoverageUploadedPct = float64(bestSemCount) / float64(len(segments)) * 100.0
+	}
+
+	isDeepfake := false
+	finalParent := ""
+	finalCoveragePct := 0.0
+	finalMatchedSegments := 0
+
+	if coverageUploadedPct >= 5.0 {
+		finalParent = bestParent
+		finalCoveragePct = coverageUploadedPct
+		finalMatchedSegments = bestCount
+	} else if semCoverageUploadedPct >= 10.0 {
+		finalParent = bestSemParent
+		finalCoveragePct = semCoverageUploadedPct
+		finalMatchedSegments = bestSemCount
+		isDeepfake = true
+	} else {
 		return &SegmentVerificationResult{MatchFound: false}, nil
 	}
 
-	parentResult, err := s.VerifyExact(ctx, bestParent)
+	parentResult, err := s.VerifyExact(ctx, finalParent)
 	if err != nil || !parentResult.MatchFound {
 		return &SegmentVerificationResult{MatchFound: false}, nil
 	}
 
-	totalRegistered, _ := s.repo.CountSegments(ctx, bestParent, pt)
+	totalRegistered, _ := s.repo.CountSegments(ctx, finalParent, pt)
 	coverageRegisteredPct := 0.0
 	if totalRegistered > 0 {
-		coverageRegisteredPct = float64(bestCount) / float64(totalRegistered) * 100.0
+		coverageRegisteredPct = float64(finalMatchedSegments) / float64(totalRegistered) * 100.0
 	}
 
-	similarity := (coverageUploadedPct + coverageRegisteredPct) / 2.0
+	similarity := (finalCoveragePct + coverageRegisteredPct) / 2.0
 
 	verified, txHash := s.crossCheckBlockchain(ctx, parentResult.Record.Sha256Hash, parentResult.Record.IpfsCid)
 
 	if parentResult.Record.WebhookUrl != "" {
+		msg := fmt.Sprintf("A matching segment of your registered asset (%s) was verified.", parentResult.Record.Sha256Hash)
+		if isDeepfake {
+			msg = fmt.Sprintf("ALERT: A Deepfake/AI-altered version of your registered asset (%s) was detected!", parentResult.Record.Sha256Hash)
+		}
 		s.dispatcher.Dispatch(parentResult.Record.WebhookUrl, webhook.Payload{
 			EventType:    webhook.EventDerivativeDetected,
 			OriginalHash: parentResult.Record.Sha256Hash,
 			Similarity:   similarity,
 			Timestamp:    time.Now().UTC().Format(time.RFC3339),
-			Message:      fmt.Sprintf("A matching segment of your registered asset (%s) was verified.", parentResult.Record.Sha256Hash),
+			Message:      msg,
 		})
 	}
 
@@ -415,14 +490,15 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 		MatchFound:              true,
 		ExactMatch:              false,
 		Similarity:              similarity,
-		MatchedSegments:         bestCount,
+		MatchedSegments:         finalMatchedSegments,
 		TotalSegmentsUploaded:   len(segments),
 		TotalSegmentsRegistered: totalRegistered,
-		CoverageUploadedPct:     coverageUploadedPct,
+		CoverageUploadedPct:     finalCoveragePct,
 		CoverageRegisteredPct:   coverageRegisteredPct,
 		Record:                  parentResult.Record,
 		OnChainVerified:         verified,
 		OnChainTxHash:           txHash,
+		IsDeepfake:              isDeepfake,
 	}
 
 	_ = s.repo.SaveSegmentCache(ctx, cacheKey, result)
@@ -481,6 +557,31 @@ func (s *service) buildPoint(sha256, creator string, phash, offset uint64, media
 			},
 		},
 		Vectors: pb.NewVectorsDense(vec),
+		Payload: payload,
+	}
+}
+
+func (s *service) buildSemanticPoint(sha256, creator string, semanticHash []float32, offset uint64, mediaType, pointType string) *pb.PointStruct {
+	if len(semanticHash) == 0 {
+		return nil
+	}
+	uuidStr := generateUUID()
+
+	payload := map[string]*pb.Value{
+		"parent_sha256":    pb.NewValueString(sha256),
+		"creator_address":  pb.NewValueString(creator),
+		"timestamp_offset": pb.NewValueInt(int64(offset)),
+		"media_type":       pb.NewValueString(mediaType),
+		"point_type":       pb.NewValueString(pointType),
+	}
+
+	return &pb.PointStruct{
+		Id: &pb.PointId{
+			PointIdOptions: &pb.PointId_Uuid{
+				Uuid: uuidStr,
+			},
+		},
+		Vectors: pb.NewVectorsDense(semanticHash),
 		Payload: payload,
 	}
 }

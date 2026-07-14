@@ -36,15 +36,18 @@ func InitQdrant(cfg *config.Config) (*QdrantClient, error) {
 		return nil, fmt.Errorf("failed to list Qdrant collections: %w", err)
 	}
 
-	exists := false
+	sigExists := false
+	semExists := false
 	for _, coll := range listResp.GetCollections() {
 		if coll.GetName() == "veritrace_signatures" {
-			exists = true
-			break
+			sigExists = true
+		}
+		if coll.GetName() == "veritrace_semantics" {
+			semExists = true
 		}
 	}
 
-	if !exists {
+	if !sigExists {
 		_, err = collectionsClient.Create(ctx, &pb.CreateCollection{
 			CollectionName: "veritrace_signatures",
 			VectorsConfig: &pb.VectorsConfig{
@@ -58,28 +61,56 @@ func InitQdrant(cfg *config.Config) (*QdrantClient, error) {
 		})
 		if err != nil {
 			conn.Close()
-			return nil, fmt.Errorf("failed to create collection: %w", err)
+			return nil, fmt.Errorf("failed to create collection signatures: %w", err)
+		}
+
+		_, err = pointsClient.CreateFieldIndex(ctx, &pb.CreateFieldIndexCollection{
+			CollectionName: "veritrace_signatures",
+			FieldName:      "parent_sha256",
+			FieldType:      pb.FieldType_FieldTypeKeyword.Enum(),
+		})
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to create field index parent_sha256: %w", err)
+		}
+
+		_, err = pointsClient.CreateFieldIndex(ctx, &pb.CreateFieldIndexCollection{
+			CollectionName: "veritrace_signatures",
+			FieldName:      "point_type",
+			FieldType:      pb.FieldType_FieldTypeKeyword.Enum(),
+		})
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to create field index point_type: %w", err)
 		}
 	}
 
-	_, err = pointsClient.CreateFieldIndex(ctx, &pb.CreateFieldIndexCollection{
-		CollectionName: "veritrace_signatures",
-		FieldName:      "parent_sha256",
-		FieldType:      pb.FieldType_FieldTypeKeyword.Enum(),
-	})
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("failed to create field index parent_sha256: %w", err)
-	}
+	if !semExists {
+		_, err = collectionsClient.Create(ctx, &pb.CreateCollection{
+			CollectionName: "veritrace_semantics",
+			VectorsConfig: &pb.VectorsConfig{
+				Config: &pb.VectorsConfig_Params{
+					Params: &pb.VectorParams{
+						Size:     512,
+						Distance: pb.Distance_Cosine,
+					},
+				},
+			},
+		})
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to create collection semantics: %w", err)
+		}
 
-	_, err = pointsClient.CreateFieldIndex(ctx, &pb.CreateFieldIndexCollection{
-		CollectionName: "veritrace_signatures",
-		FieldName:      "point_type",
-		FieldType:      pb.FieldType_FieldTypeKeyword.Enum(),
-	})
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("failed to create field index point_type: %w", err)
+		_, err = pointsClient.CreateFieldIndex(ctx, &pb.CreateFieldIndexCollection{
+			CollectionName: "veritrace_semantics",
+			FieldName:      "parent_sha256",
+			FieldType:      pb.FieldType_FieldTypeKeyword.Enum(),
+		})
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to create semantics field index parent_sha256: %w", err)
+		}
 	}
 
 	return &QdrantClient{
