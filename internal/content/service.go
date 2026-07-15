@@ -509,8 +509,10 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 func segmentPointType(mediaType string) string {
 	if mediaType == "video" {
 		return "keyframe"
+	} else if mediaType == "document" {
+		return "page"
 	}
-	return "page"
+	return "image"
 }
 
 // crossCheckBlockchain calls the OnChainVerifier to ensure the IPFS CID in our DB matches the one on-chain.
