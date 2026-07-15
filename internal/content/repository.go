@@ -18,9 +18,12 @@ type Repository interface {
 	SaveCache(ctx context.Context, record database.ContentRecord) error
 	GetCache(ctx context.Context, hash string) (*database.ContentRecord, error)
 	SaveVectors(ctx context.Context, points []*pb.PointStruct) error
+	SaveSemanticVectors(ctx context.Context, points []*pb.PointStruct) error
 	SearchVectors(ctx context.Context, vec []float32, limit uint32) ([]*pb.ScoredPoint, error)
+	SearchSemanticVectors(ctx context.Context, vec []float32, limit uint32) ([]*pb.ScoredPoint, error)
 	SearchVectorsWithFilter(ctx context.Context, vec []float32, limit uint32, pointType string) ([]*pb.ScoredPoint, error)
 	SearchVectorsBatch(ctx context.Context, vecs [][]float32, limit uint32, pointType string) ([][]*pb.ScoredPoint, error)
+	SearchSemanticVectorsBatch(ctx context.Context, vecs [][]float32, limit uint32, pointType string) ([][]*pb.ScoredPoint, error)
 	CountSegments(ctx context.Context, parentSha256, pointType string) (int, error)
 	SaveSegmentCache(ctx context.Context, key string, result *SegmentVerificationResult) error
 	GetSegmentCache(ctx context.Context, key string) (*SegmentVerificationResult, error)
@@ -141,9 +144,40 @@ func (r *repository) SaveVectors(ctx context.Context, points []*pb.PointStruct) 
 	return err
 }
 
+func (r *repository) SaveSemanticVectors(ctx context.Context, points []*pb.PointStruct) error {
+	if len(points) == 0 {
+		return nil
+	}
+	_, err := r.qdrant.Points.Upsert(ctx, &pb.UpsertPoints{
+		CollectionName: "veritrace_semantics",
+		Points:         points,
+	})
+	return err
+}
+
 func (r *repository) SearchVectors(ctx context.Context, vec []float32, limit uint32) ([]*pb.ScoredPoint, error) {
 	resp, err := r.qdrant.Points.Search(ctx, &pb.SearchPoints{
 		CollectionName: "veritrace_signatures",
+		Vector:         vec,
+		Limit:          uint64(limit),
+		WithPayload: &pb.WithPayloadSelector{
+			SelectorOptions: &pb.WithPayloadSelector_Enable{
+				Enable: true,
+			},
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp.GetResult(), nil
+}
+
+func (r *repository) SearchSemanticVectors(ctx context.Context, vec []float32, limit uint32) ([]*pb.ScoredPoint, error) {
+	if len(vec) == 0 {
+		return nil, nil
+	}
+	resp, err := r.qdrant.Points.Search(ctx, &pb.SearchPoints{
+		CollectionName: "veritrace_semantics",
 		Vector:         vec,
 		Limit:          uint64(limit),
 		WithPayload: &pb.WithPayloadSelector{
@@ -192,53 +226,98 @@ func (r *repository) SearchVectorsWithFilter(ctx context.Context, vec []float32,
 }
 
 func (r *repository) SearchVectorsBatch(ctx context.Context, vecs [][]float32, limit uint32, pointType string) ([][]*pb.ScoredPoint, error) {
-	if len(vecs) == 0 {
-		return nil, nil
-	}
-
-	withPayload := &pb.WithPayloadSelector{
-		SelectorOptions: &pb.WithPayloadSelector_Enable{Enable: true},
-	}
-	filter := &pb.Filter{
-		Must: []*pb.Condition{
-			{
-				ConditionOneOf: &pb.Condition_Field{
-					Field: &pb.FieldCondition{
-						Key: "point_type",
-						Match: &pb.Match{
-							MatchValue: &pb.Match_Keyword{
-								Keyword: pointType,
+	var searchPoints []*pb.SearchPoints
+	for _, v := range vecs {
+		searchPoints = append(searchPoints, &pb.SearchPoints{
+			CollectionName: "veritrace_signatures",
+			Vector:         v,
+			Limit:          uint64(limit),
+			Filter: &pb.Filter{
+				Must: []*pb.Condition{
+					{
+						ConditionOneOf: &pb.Condition_Field{
+							Field: &pb.FieldCondition{
+								Key: "point_type",
+								Match: &pb.Match{
+									MatchValue: &pb.Match_Keyword{
+										Keyword: pointType,
+									},
+								},
 							},
 						},
 					},
 				},
 			},
-		},
+			WithPayload: &pb.WithPayloadSelector{
+				SelectorOptions: &pb.WithPayloadSelector_Enable{
+					Enable: true,
+				},
+			},
+		})
 	}
-
-	searches := make([]*pb.SearchPoints, len(vecs))
-	for i, vec := range vecs {
-		searches[i] = &pb.SearchPoints{
-			CollectionName: "veritrace_signatures",
-			Vector:         vec,
-			Limit:          uint64(limit),
-			WithPayload:    withPayload,
-			Filter:         filter,
-		}
-	}
-
 	resp, err := r.qdrant.Points.SearchBatch(ctx, &pb.SearchBatchPoints{
 		CollectionName: "veritrace_signatures",
-		SearchPoints:   searches,
+		SearchPoints:   searchPoints,
 	})
 	if err != nil {
 		return nil, err
 	}
+	var results [][]*pb.ScoredPoint
+	for _, batchResult := range resp.GetResult() {
+		results = append(results, batchResult.GetResult())
+	}
+	return results, nil
+}
 
-	batchResults := resp.GetResult()
-	results := make([][]*pb.ScoredPoint, len(batchResults))
-	for i, batchResult := range batchResults {
-		results[i] = batchResult.GetResult()
+func (r *repository) SearchSemanticVectorsBatch(ctx context.Context, vecs [][]float32, limit uint32, pointType string) ([][]*pb.ScoredPoint, error) {
+	if len(vecs) == 0 {
+		return nil, nil
+	}
+	var searchPoints []*pb.SearchPoints
+	for _, v := range vecs {
+		if len(v) == 0 {
+			continue
+		}
+		searchPoints = append(searchPoints, &pb.SearchPoints{
+			CollectionName: "veritrace_semantics",
+			Vector:         v,
+			Limit:          uint64(limit),
+			Filter: &pb.Filter{
+				Must: []*pb.Condition{
+					{
+						ConditionOneOf: &pb.Condition_Field{
+							Field: &pb.FieldCondition{
+								Key: "point_type",
+								Match: &pb.Match{
+									MatchValue: &pb.Match_Keyword{
+										Keyword: pointType,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			WithPayload: &pb.WithPayloadSelector{
+				SelectorOptions: &pb.WithPayloadSelector_Enable{
+					Enable: true,
+				},
+			},
+		})
+	}
+	if len(searchPoints) == 0 {
+		return nil, nil
+	}
+	resp, err := r.qdrant.Points.SearchBatch(ctx, &pb.SearchBatchPoints{
+		CollectionName: "veritrace_semantics",
+		SearchPoints:   searchPoints,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var results [][]*pb.ScoredPoint
+	for _, batchResult := range resp.GetResult() {
+		results = append(results, batchResult.GetResult())
 	}
 	return results, nil
 }

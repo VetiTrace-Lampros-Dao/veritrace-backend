@@ -14,13 +14,15 @@ import (
 )
 
 type KeyframePayload struct {
-	Offset uint64 `json:"offset"`
-	PHash  uint64 `json:"phash"`
+	Offset       uint64    `json:"offset"`
+	PHash        uint64    `json:"phash"`
+	SemanticHash []float32 `json:"semantic_hash,omitempty"`
 }
 
 type MetadataJSON struct {
 	SHA256              string            `json:"sha256"`
 	RepresentativePHash uint64            `json:"representative_phash"`
+	SemanticHash        []float32         `json:"semantic_hash,omitempty"`
 	MediaType           string            `json:"media_type"`
 	MediaIpfsUrl        string            `json:"media_ipfs_url"`
 	MediaS3Url          string            `json:"media_s3_url"`
@@ -89,8 +91,9 @@ func (p *Pipeline) processEvent(ctx context.Context, event EventPayload) error {
 		}
 		for _, kf := range meta.Keyframes {
 			keyframes = append(keyframes, content.KeyframePayload{
-				Offset: kf.Offset,
-				PHash:  kf.PHash,
+				Offset:       kf.Offset,
+				PHash:        kf.PHash,
+				SemanticHash: kf.SemanticHash,
 			})
 		}
 		record.MediaIpfsUrl = meta.MediaIpfsUrl
@@ -104,7 +107,12 @@ func (p *Pipeline) processEvent(ctx context.Context, event EventPayload) error {
 
 	record.MediaType = mediaType
 
-	if err := p.contentService.Register(ctx, record, keyframes, mediaType); err != nil {
+	var rootSemHash []float32
+	if meta != nil {
+		rootSemHash = meta.SemanticHash
+	}
+
+	if err := p.contentService.Register(ctx, record, keyframes, mediaType, rootSemHash); err != nil {
 		return fmt.Errorf("failed to register content: %w", err)
 	}
 
@@ -117,31 +125,48 @@ func (p *Pipeline) fetchMetadata(ctx context.Context, ipfsCid string) (*Metadata
 		return nil, fmt.Errorf("empty IPFS CID")
 	}
 
-	url := fmt.Sprintf("https://ipfs.io/ipfs/%s", ipfsCid)
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return nil, err
+	gateways := []string{
+		"https://gateway.pinata.cloud/ipfs/%s",
+		"https://cloudflare-ipfs.com/ipfs/%s",
+		"https://ipfs.io/ipfs/%s",
 	}
 
 	client := http.Client{
-		Timeout: 5 * time.Second,
+		Timeout: 10 * time.Second,
 	}
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+	var lastErr error
+	for _, gw := range gateways {
+		url := fmt.Sprintf(gw, ipfsCid)
+		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP status %d", resp.StatusCode)
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			lastErr = fmt.Errorf("HTTP status %d on %s", resp.StatusCode, gw)
+			continue
+		}
+
+		var meta MetadataJSON
+		if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
+			resp.Body.Close()
+			lastErr = err
+			continue
+		}
+		resp.Body.Close()
+
+		return &meta, nil
 	}
 
-	var meta MetadataJSON
-	if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
-		return nil, err
-	}
-
-	return &meta, nil
+	return nil, fmt.Errorf("all gateways failed. last error: %v", lastErr)
 }
 
