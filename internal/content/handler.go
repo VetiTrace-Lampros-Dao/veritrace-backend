@@ -114,8 +114,9 @@ func (h *Handler) PinFile(c *gin.Context) {
 }
 func (h *Handler) VerifySegments(c *gin.Context) {
 	var req struct {
-		SHA256    string           `json:"sha256"`
-		MediaType string           `json:"media_type"`
+		SHA256    string            `json:"sha256"`
+		MediaType string            `json:"media_type"`
+		AudioHash []float32         `json:"audio_hash,omitempty"`
 		Segments  []KeyframePayload `json:"segments"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -127,7 +128,7 @@ func (h *Handler) VerifySegments(c *gin.Context) {
 		return
 	}
 
-	result, err := h.service.VerifySegments(c.Request.Context(), req.SHA256, req.Segments, req.MediaType)
+	result, err := h.service.VerifySegments(c.Request.Context(), req.SHA256, req.Segments, req.MediaType, req.AudioHash)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

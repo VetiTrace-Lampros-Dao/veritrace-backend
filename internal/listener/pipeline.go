@@ -25,6 +25,7 @@ type MetadataJSON struct {
 	RepresentativePHash uint64            `json:"representative_phash"`
 	SemanticHash        []float32         `json:"semantic_hash,omitempty"`
 	FaceHashes          [][]float32       `json:"face_hashes,omitempty"`
+	AudioHash           []float32         `json:"audio_hash,omitempty"`
 	MediaType           string            `json:"media_type"`
 	MediaIpfsUrl        string            `json:"media_ipfs_url"`
 	MediaS3Url          string            `json:"media_s3_url"`
@@ -112,13 +113,15 @@ func (p *Pipeline) processEvent(ctx context.Context, event EventPayload) error {
 
 	var rootSemHash []float32
 	var rootFaceHashes [][]float32
+	var rootAudioHash []float32
 	if meta != nil {
 		rootSemHash = meta.SemanticHash
 		rootFaceHashes = meta.FaceHashes
+		rootAudioHash = meta.AudioHash
 		mediaType = meta.MediaType
 	}
 
-	if err := p.contentService.Register(ctx, record, keyframes, mediaType, rootSemHash, rootFaceHashes); err != nil {
+	if err := p.contentService.Register(ctx, record, keyframes, mediaType, rootSemHash, rootFaceHashes, rootAudioHash); err != nil {
 		return fmt.Errorf("failed to register content: %w", err)
 	}
 

@@ -20,12 +20,14 @@ type Repository interface {
 	SaveVectors(ctx context.Context, points []*pb.PointStruct) error
 	SaveSemanticVectors(ctx context.Context, points []*pb.PointStruct) error
 	SaveFaceVectors(ctx context.Context, points []*pb.PointStruct) error
+	SaveAudioVectors(ctx context.Context, points []*pb.PointStruct) error
 	SearchVectors(ctx context.Context, vec []float32, limit uint32) ([]*pb.ScoredPoint, error)
 	SearchSemanticVectors(ctx context.Context, vec []float32, limit uint32) ([]*pb.ScoredPoint, error)
 	SearchVectorsWithFilter(ctx context.Context, vec []float32, limit uint32, pointType string) ([]*pb.ScoredPoint, error)
 	SearchVectorsBatch(ctx context.Context, vecs [][]float32, limit uint32, pointType string) ([][]*pb.ScoredPoint, error)
 	SearchSemanticVectorsBatch(ctx context.Context, vecs [][]float32, limit uint32, pointType string) ([][]*pb.ScoredPoint, error)
 	SearchFaceVectorsBatch(ctx context.Context, vecs [][]float32, limit uint32, pointType string) ([][]*pb.ScoredPoint, error)
+	SearchAudioVectorsBatch(ctx context.Context, vecs [][]float32, limit uint32, pointType string) ([][]*pb.ScoredPoint, error)
 	CountSegments(ctx context.Context, parentSha256, pointType string) (int, error)
 	SaveSegmentCache(ctx context.Context, key string, result *SegmentVerificationResult) error
 	GetSegmentCache(ctx context.Context, key string) (*SegmentVerificationResult, error)
@@ -163,6 +165,17 @@ func (r *repository) SaveFaceVectors(ctx context.Context, points []*pb.PointStru
 	}
 	_, err := r.qdrant.Points.Upsert(ctx, &pb.UpsertPoints{
 		CollectionName: "veritrace_faces",
+		Points:         points,
+	})
+	return err
+}
+
+func (r *repository) SaveAudioVectors(ctx context.Context, points []*pb.PointStruct) error {
+	if len(points) == 0 {
+		return nil
+	}
+	_, err := r.qdrant.Points.Upsert(ctx, &pb.UpsertPoints{
+		CollectionName: "veritrace_audio",
 		Points:         points,
 	})
 	return err
@@ -321,16 +334,85 @@ func (r *repository) SearchSemanticVectorsBatch(ctx context.Context, vecs [][]fl
 	if len(searchPoints) == 0 {
 		return nil, nil
 	}
-	resp, err := r.qdrant.Points.SearchBatch(ctx, &pb.SearchBatchPoints{
-		CollectionName: "veritrace_semantics",
-		SearchPoints:   searchPoints,
-	})
-	if err != nil {
-		return nil, err
+	var results [][]*pb.ScoredPoint
+	// Process in batches of 100 to avoid grpc limits
+	batchSize := 100
+	for i := 0; i < len(searchPoints); i += batchSize {
+		end := i + batchSize
+		if end > len(searchPoints) {
+			end = len(searchPoints)
+		}
+		resp, err := r.qdrant.Points.SearchBatch(ctx, &pb.SearchBatchPoints{
+			CollectionName: "veritrace_semantics",
+			SearchPoints:   searchPoints[i:end],
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, batchResult := range resp.GetResult() {
+			results = append(results, batchResult.GetResult())
+		}
+	}
+	return results, nil
+}
+
+func (r *repository) SearchAudioVectorsBatch(ctx context.Context, vecs [][]float32, limit uint32, pointType string) ([][]*pb.ScoredPoint, error) {
+	if len(vecs) == 0 {
+		return nil, nil
+	}
+	var searchPoints []*pb.SearchPoints
+	for _, v := range vecs {
+		if len(v) == 0 {
+			continue
+		}
+		searchPoints = append(searchPoints, &pb.SearchPoints{
+			CollectionName: "veritrace_audio",
+			Vector:         v,
+			Limit:          uint64(limit),
+			Filter: &pb.Filter{
+				Must: []*pb.Condition{
+					{
+						ConditionOneOf: &pb.Condition_Field{
+							Field: &pb.FieldCondition{
+								Key: "point_type",
+								Match: &pb.Match{
+									MatchValue: &pb.Match_Keyword{
+										Keyword: pointType,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			WithPayload: &pb.WithPayloadSelector{
+				SelectorOptions: &pb.WithPayloadSelector_Enable{
+					Enable: true,
+				},
+			},
+		})
+	}
+	if len(searchPoints) == 0 {
+		return nil, nil
 	}
 	var results [][]*pb.ScoredPoint
-	for _, batchResult := range resp.GetResult() {
-		results = append(results, batchResult.GetResult())
+	// Process in batches of 100 to avoid grpc limits
+	batchSize := 100
+	for i := 0; i < len(searchPoints); i += batchSize {
+		end := i + batchSize
+		if end > len(searchPoints) {
+			end = len(searchPoints)
+		}
+		resp, err := r.qdrant.Points.SearchBatch(ctx, &pb.SearchBatchPoints{
+			CollectionName: "veritrace_audio",
+			SearchPoints:   searchPoints[i:end],
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, batchResult := range resp.GetResult() {
+			results = append(results, batchResult.GetResult())
+		}
 	}
 	return results, nil
 }
