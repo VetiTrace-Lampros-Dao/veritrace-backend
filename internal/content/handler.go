@@ -116,7 +116,7 @@ func (h *Handler) VerifySegments(c *gin.Context) {
 	var req struct {
 		SHA256    string            `json:"sha256"`
 		MediaType string            `json:"media_type"`
-		AudioHash []float32         `json:"audio_hash,omitempty"`
+		AudioHash []float32         `json:"audio_hashes,omitempty"`
 		Segments  []KeyframePayload `json:"segments"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {

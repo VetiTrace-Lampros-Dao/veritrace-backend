@@ -25,7 +25,7 @@ type MetadataJSON struct {
 	RepresentativePHash uint64            `json:"representative_phash"`
 	SemanticHash        []float32         `json:"semantic_hash,omitempty"`
 	FaceHashes          [][]float32       `json:"face_hashes,omitempty"`
-	AudioHash           []float32         `json:"audio_hash,omitempty"`
+	AudioHash           []float32         `json:"audio_hashes,omitempty"`
 	MediaType           string            `json:"media_type"`
 	MediaIpfsUrl        string            `json:"media_ipfs_url"`
 	MediaS3Url          string            `json:"media_s3_url"`
