@@ -525,6 +525,7 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 			continue
 		}
 		top := results[0]
+		log.Printf("DEBUG: Top Audio Match Score: %f", float64(top.GetScore()))
 		if float64(top.GetScore()) < audioThreshold {
 			continue
 		}
