@@ -14,15 +14,17 @@ import (
 )
 
 type KeyframePayload struct {
-	Offset       uint64    `json:"offset"`
-	PHash        uint64    `json:"phash"`
-	SemanticHash []float32 `json:"semantic_hash,omitempty"`
+	Offset       uint64      `json:"offset"`
+	PHash        uint64      `json:"phash"`
+	SemanticHash []float32   `json:"semantic_hash,omitempty"`
+	FaceHashes   [][]float32 `json:"face_hashes,omitempty"`
 }
 
 type MetadataJSON struct {
 	SHA256              string            `json:"sha256"`
 	RepresentativePHash uint64            `json:"representative_phash"`
 	SemanticHash        []float32         `json:"semantic_hash,omitempty"`
+	FaceHashes          [][]float32       `json:"face_hashes,omitempty"`
 	MediaType           string            `json:"media_type"`
 	MediaIpfsUrl        string            `json:"media_ipfs_url"`
 	MediaS3Url          string            `json:"media_s3_url"`
@@ -94,6 +96,7 @@ func (p *Pipeline) processEvent(ctx context.Context, event EventPayload) error {
 				Offset:       kf.Offset,
 				PHash:        kf.PHash,
 				SemanticHash: kf.SemanticHash,
+				FaceHashes:   kf.FaceHashes,
 			})
 		}
 		record.MediaIpfsUrl = meta.MediaIpfsUrl
@@ -108,11 +111,14 @@ func (p *Pipeline) processEvent(ctx context.Context, event EventPayload) error {
 	record.MediaType = mediaType
 
 	var rootSemHash []float32
+	var rootFaceHashes [][]float32
 	if meta != nil {
 		rootSemHash = meta.SemanticHash
+		rootFaceHashes = meta.FaceHashes
+		mediaType = meta.MediaType
 	}
 
-	if err := p.contentService.Register(ctx, record, keyframes, mediaType, rootSemHash); err != nil {
+	if err := p.contentService.Register(ctx, record, keyframes, mediaType, rootSemHash, rootFaceHashes); err != nil {
 		return fmt.Errorf("failed to register content: %w", err)
 	}
 

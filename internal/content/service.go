@@ -23,9 +23,10 @@ import (
 )
 
 type KeyframePayload struct {
-	Offset       uint64    `json:"offset"`
-	PHash        uint64    `json:"phash"`
-	SemanticHash []float32 `json:"semantic_hash,omitempty"`
+	Offset       uint64      `json:"offset"`
+	PHash        uint64      `json:"phash"`
+	SemanticHash []float32   `json:"semantic_hash,omitempty"`
+	FaceHashes   [][]float32 `json:"face_hashes,omitempty"`
 }
 
 type VerificationResult struct {
@@ -66,7 +67,7 @@ type VerificationCertificate struct {
 }
 
 type Service interface {
-	Register(ctx context.Context, record database.ContentRecord, keyframes []KeyframePayload, mediaType string, rootSemanticHash []float32) error
+	Register(ctx context.Context, record database.ContentRecord, keyframes []KeyframePayload, mediaType string, rootSemanticHash []float32, rootFaceHashes [][]float32) error
 	VerifyExact(ctx context.Context, hash string) (*VerificationResult, error)
 	VerifyFuzzy(ctx context.Context, phash uint64) (*VerificationResult, error)
 	VerifySegments(ctx context.Context, sha256 string, segments []KeyframePayload, mediaType string) (*SegmentVerificationResult, error)
@@ -104,7 +105,7 @@ func (s *service) SaveCheckpoint(ctx context.Context, key string, val uint64) er
 	return s.repo.SaveCheckpoint(ctx, key, val)
 }
 
-func (s *service) Register(ctx context.Context, record database.ContentRecord, keyframes []KeyframePayload, mediaType string, rootSemanticHash []float32) error {
+func (s *service) Register(ctx context.Context, record database.ContentRecord, keyframes []KeyframePayload, mediaType string, rootSemanticHash []float32, rootFaceHashes [][]float32) error {
 	if err := s.repo.SavePostgres(ctx, record); err != nil {
 		return fmt.Errorf("failed to save to postgres: %w", err)
 	}
@@ -116,15 +117,27 @@ func (s *service) Register(ctx context.Context, record database.ContentRecord, k
 	var points []*pb.PointStruct
 	var semPoints []*pb.PointStruct
 
+	var facePoints []*pb.PointStruct
+
 	if mediaType == "document" {
 		points = append(points, s.buildPoint(record.Sha256Hash, record.CreatorAddress, record.PHash, 0, mediaType, "document"))
 		if sp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, rootSemanticHash, 0, mediaType, "document"); sp != nil {
 			semPoints = append(semPoints, sp)
 		}
+		for _, fh := range rootFaceHashes {
+			if fp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, fh, 0, mediaType, "document"); fp != nil {
+				facePoints = append(facePoints, fp)
+			}
+		}
 		for _, kf := range keyframes {
 			points = append(points, s.buildPoint(record.Sha256Hash, record.CreatorAddress, kf.PHash, kf.Offset, mediaType, "page"))
 			if sp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, kf.SemanticHash, kf.Offset, mediaType, "page"); sp != nil {
 				semPoints = append(semPoints, sp)
+			}
+			for _, fh := range kf.FaceHashes {
+				if fp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, fh, kf.Offset, mediaType, "page"); fp != nil {
+					facePoints = append(facePoints, fp)
+				}
 			}
 		}
 	} else if mediaType == "video" && len(keyframes) > 0 {
@@ -133,11 +146,21 @@ func (s *service) Register(ctx context.Context, record database.ContentRecord, k
 			if sp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, kf.SemanticHash, kf.Offset, mediaType, "keyframe"); sp != nil {
 				semPoints = append(semPoints, sp)
 			}
+			for _, fh := range kf.FaceHashes {
+				if fp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, fh, kf.Offset, mediaType, "keyframe"); fp != nil {
+					facePoints = append(facePoints, fp)
+				}
+			}
 		}
 	} else {
 		points = append(points, s.buildPoint(record.Sha256Hash, record.CreatorAddress, record.PHash, 0, mediaType, "image"))
 		if sp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, rootSemanticHash, 0, mediaType, "image"); sp != nil {
 			semPoints = append(semPoints, sp)
+		}
+		for _, fh := range rootFaceHashes {
+			if fp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, fh, 0, mediaType, "image"); fp != nil {
+				facePoints = append(facePoints, fp)
+			}
 		}
 	}
 
@@ -146,6 +169,11 @@ func (s *service) Register(ctx context.Context, record database.ContentRecord, k
 	}
 	if err := s.repo.SaveSemanticVectors(ctx, semPoints); err != nil {
 		return fmt.Errorf("failed to index semantic vectors: %w", err)
+	}
+	if len(facePoints) > 0 {
+		if err := s.repo.SaveFaceVectors(ctx, facePoints); err != nil {
+			log.Printf("Failed to index face vectors: %v", err)
+		}
 	}
 
 	return nil
@@ -358,9 +386,14 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 
 	vecs := make([][]float32, len(segments))
 	semVecs := make([][]float32, len(segments))
+	var faceVecs [][]float32 // Flattened array of all faces from all segments
+	
 	for i, seg := range segments {
 		vecs[i] = phashToVector(seg.PHash)
 		semVecs[i] = seg.SemanticHash
+		for _, fh := range seg.FaceHashes {
+			faceVecs = append(faceVecs, fh)
+		}
 	}
 
 	batchResults, err := s.repo.SearchVectorsBatch(ctx, vecs, 1, pt)
@@ -371,6 +404,14 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 	semBatchResults, err := s.repo.SearchSemanticVectorsBatch(ctx, semVecs, 1, pt)
 	if err != nil {
 		log.Printf("SearchSemanticVectorsBatch failed: %v", err)
+	}
+	
+	var faceBatchResults [][]*pb.ScoredPoint
+	if len(faceVecs) > 0 {
+		faceBatchResults, err = s.repo.SearchFaceVectorsBatch(ctx, faceVecs, 1, pt)
+		if err != nil {
+			log.Printf("SearchFaceVectorsBatch failed: %v", err)
+		}
 	}
 
 	matchCounts := make(map[string]int)
@@ -411,6 +452,26 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 		}
 	}
 
+	faceMatchCounts := make(map[string]int)
+	faceThreshold := 0.6 // Cosine similarity threshold for ArcFace
+	for _, results := range faceBatchResults {
+		if len(results) == 0 {
+			continue
+		}
+		top := results[0]
+		if float64(top.GetScore()) < faceThreshold {
+			continue
+		}
+		payload := top.GetPayload()
+		if payload == nil {
+			continue
+		}
+		parentVal, ok := payload["parent_sha256"]
+		if ok {
+			faceMatchCounts[parentVal.GetStringValue()]++
+		}
+	}
+
 	bestParent := ""
 	bestCount := 0
 	for parent, count := range matchCounts {
@@ -429,6 +490,15 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 		}
 	}
 
+	bestFaceParent := ""
+	bestFaceCount := 0
+	for parent, count := range faceMatchCounts {
+		if count > bestFaceCount {
+			bestFaceCount = count
+			bestFaceParent = parent
+		}
+	}
+
 	coverageUploadedPct := 0.0
 	if len(segments) > 0 {
 		coverageUploadedPct = float64(bestCount) / float64(len(segments)) * 100.0
@@ -437,6 +507,11 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 	semCoverageUploadedPct := 0.0
 	if len(segments) > 0 {
 		semCoverageUploadedPct = float64(bestSemCount) / float64(len(segments)) * 100.0
+	}
+	
+	faceCoverageUploadedPct := 0.0
+	if len(segments) > 0 {
+		faceCoverageUploadedPct = float64(bestFaceCount) / float64(len(segments)) * 100.0
 	}
 
 	isDeepfake := false
@@ -448,6 +523,11 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 		finalParent = bestParent
 		finalCoveragePct = coverageUploadedPct
 		finalMatchedSegments = bestCount
+	} else if faceCoverageUploadedPct >= 10.0 {
+		finalParent = bestFaceParent
+		finalCoveragePct = faceCoverageUploadedPct
+		finalMatchedSegments = bestFaceCount
+		isDeepfake = true
 	} else if semCoverageUploadedPct >= 10.0 {
 		finalParent = bestSemParent
 		finalCoveragePct = semCoverageUploadedPct

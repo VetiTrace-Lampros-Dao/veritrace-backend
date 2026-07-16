@@ -38,12 +38,16 @@ func InitQdrant(cfg *config.Config) (*QdrantClient, error) {
 
 	sigExists := false
 	semExists := false
+	faceExists := false
 	for _, coll := range listResp.GetCollections() {
 		if coll.GetName() == "veritrace_signatures" {
 			sigExists = true
 		}
 		if coll.GetName() == "veritrace_semantics" {
 			semExists = true
+		}
+		if coll.GetName() == "veritrace_faces" {
+			faceExists = true
 		}
 	}
 
@@ -110,6 +114,34 @@ func InitQdrant(cfg *config.Config) (*QdrantClient, error) {
 		if err != nil {
 			conn.Close()
 			return nil, fmt.Errorf("failed to create semantics field index parent_sha256: %w", err)
+		}
+	}
+	
+	if !faceExists {
+		_, err = collectionsClient.Create(ctx, &pb.CreateCollection{
+			CollectionName: "veritrace_faces",
+			VectorsConfig: &pb.VectorsConfig{
+				Config: &pb.VectorsConfig_Params{
+					Params: &pb.VectorParams{
+						Size:     512,
+						Distance: pb.Distance_Cosine,
+					},
+				},
+			},
+		})
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to create collection faces: %w", err)
+		}
+
+		_, err = pointsClient.CreateFieldIndex(ctx, &pb.CreateFieldIndexCollection{
+			CollectionName: "veritrace_faces",
+			FieldName:      "parent_sha256",
+			FieldType:      pb.FieldType_FieldTypeKeyword.Enum(),
+		})
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to create faces field index parent_sha256: %w", err)
 		}
 	}
 
