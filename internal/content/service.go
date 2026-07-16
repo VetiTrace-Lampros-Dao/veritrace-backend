@@ -54,6 +54,7 @@ type SegmentVerificationResult struct {
 	OnChainTxHash           string                  `json:"on_chain_tx_hash,omitempty"`
 	IsDeepfake              bool                    `json:"is_deepfake"`
 	IsAudioDeepfake         bool                    `json:"is_audio_deepfake"`
+	DebugVersion            string                  `json:"debug_version,omitempty"`
 }
 
 type VerificationCertificate struct {
@@ -387,6 +388,7 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 			Record:                  exactResult.Record,
 			OnChainVerified:         exactResult.OnChainVerified,
 			OnChainTxHash:           exactResult.OnChainTxHash,
+			DebugVersion:            "v2",
 		}, nil
 	}
 
@@ -645,6 +647,7 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 		OnChainTxHash:           txHash,
 		IsDeepfake:              isDeepfake,
 		IsAudioDeepfake:         isAudioDeepfake,
+		DebugVersion:            "v2",
 	}
 
 	_ = s.repo.SaveSegmentCache(ctx, cacheKey, result)
