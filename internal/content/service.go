@@ -519,7 +519,7 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 	}
 
 	audioMatchCounts := make(map[string]int)
-	audioThreshold := 0.98 // Increased threshold because wav2vec2 mean embeddings have very high baseline similarity
+	audioThreshold := 0.999 // Increased threshold because wav2vec2 mean embeddings collapse heavily
 	for _, results := range audioBatchResults {
 		if len(results) == 0 {
 			continue
