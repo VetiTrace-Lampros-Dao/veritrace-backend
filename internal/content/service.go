@@ -53,6 +53,7 @@ type SegmentVerificationResult struct {
 	OnChainVerified         bool                    `json:"on_chain_verified"`
 	OnChainTxHash           string                  `json:"on_chain_tx_hash,omitempty"`
 	IsDeepfake              bool                    `json:"is_deepfake"`
+	IsAudioDeepfake         bool                    `json:"is_audio_deepfake"`
 }
 
 type VerificationCertificate struct {
@@ -67,10 +68,10 @@ type VerificationCertificate struct {
 }
 
 type Service interface {
-	Register(ctx context.Context, record database.ContentRecord, keyframes []KeyframePayload, mediaType string, rootSemanticHash []float32, rootFaceHashes [][]float32) error
+	Register(ctx context.Context, record database.ContentRecord, keyframes []KeyframePayload, mediaType string, rootSemanticHash []float32, rootFaceHashes [][]float32, rootAudioHash []float32) error
 	VerifyExact(ctx context.Context, hash string) (*VerificationResult, error)
 	VerifyFuzzy(ctx context.Context, phash uint64) (*VerificationResult, error)
-	VerifySegments(ctx context.Context, sha256 string, segments []KeyframePayload, mediaType string) (*SegmentVerificationResult, error)
+	VerifySegments(ctx context.Context, sha256 string, segments []KeyframePayload, mediaType string, audioHash []float32) (*SegmentVerificationResult, error)
 	GenerateCertificate(ctx context.Context, hash string) (*VerificationCertificate, error)
 	PinToIPFS(ctx context.Context, payload interface{}) (string, error)
 	PinFile(ctx context.Context, reader io.Reader, filename, contentType string) (string, string, error)
@@ -105,7 +106,7 @@ func (s *service) SaveCheckpoint(ctx context.Context, key string, val uint64) er
 	return s.repo.SaveCheckpoint(ctx, key, val)
 }
 
-func (s *service) Register(ctx context.Context, record database.ContentRecord, keyframes []KeyframePayload, mediaType string, rootSemanticHash []float32, rootFaceHashes [][]float32) error {
+func (s *service) Register(ctx context.Context, record database.ContentRecord, keyframes []KeyframePayload, mediaType string, rootSemanticHash []float32, rootFaceHashes [][]float32, rootAudioHash []float32) error {
 	if err := s.repo.SavePostgres(ctx, record); err != nil {
 		return fmt.Errorf("failed to save to postgres: %w", err)
 	}
@@ -118,6 +119,7 @@ func (s *service) Register(ctx context.Context, record database.ContentRecord, k
 	var semPoints []*pb.PointStruct
 
 	var facePoints []*pb.PointStruct
+	var audioPoints []*pb.PointStruct
 
 	if mediaType == "document" {
 		points = append(points, s.buildPoint(record.Sha256Hash, record.CreatorAddress, record.PHash, 0, mediaType, "document"))
@@ -141,6 +143,9 @@ func (s *service) Register(ctx context.Context, record database.ContentRecord, k
 			}
 		}
 	} else if mediaType == "video" && len(keyframes) > 0 {
+		if ap := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, rootAudioHash, 0, mediaType, "video"); ap != nil {
+			audioPoints = append(audioPoints, ap)
+		}
 		for _, kf := range keyframes {
 			points = append(points, s.buildPoint(record.Sha256Hash, record.CreatorAddress, kf.PHash, kf.Offset, mediaType, "keyframe"))
 			if sp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, kf.SemanticHash, kf.Offset, mediaType, "keyframe"); sp != nil {
@@ -173,6 +178,11 @@ func (s *service) Register(ctx context.Context, record database.ContentRecord, k
 	if len(facePoints) > 0 {
 		if err := s.repo.SaveFaceVectors(ctx, facePoints); err != nil {
 			log.Printf("Failed to index face vectors: %v", err)
+		}
+	}
+	if len(audioPoints) > 0 {
+		if err := s.repo.SaveAudioVectors(ctx, audioPoints); err != nil {
+			log.Printf("Failed to index audio vectors: %v", err)
 		}
 	}
 
@@ -352,7 +362,7 @@ func (s *service) VerifyFuzzy(ctx context.Context, phash uint64) (*VerificationR
 
 }
 
-func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []KeyframePayload, mediaType string) (*SegmentVerificationResult, error) {
+func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []KeyframePayload, mediaType string, audioHash []float32) (*SegmentVerificationResult, error) {
 	if len(segments) == 0 {
 		return &SegmentVerificationResult{MatchFound: false}, nil
 	}
@@ -411,6 +421,15 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 		faceBatchResults, err = s.repo.SearchFaceVectorsBatch(ctx, faceVecs, 1, pt)
 		if err != nil {
 			log.Printf("SearchFaceVectorsBatch failed: %v", err)
+		}
+	}
+
+	var audioBatchResults [][]*pb.ScoredPoint
+	if len(audioHash) > 0 {
+		// Only one audio hash per video
+		audioBatchResults, err = s.repo.SearchAudioVectorsBatch(ctx, [][]float32{audioHash}, 1, "video")
+		if err != nil {
+			log.Printf("SearchAudioVectorsBatch failed: %v", err)
 		}
 	}
 
@@ -499,6 +518,26 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 		}
 	}
 
+	audioMatchCounts := make(map[string]int)
+	audioThreshold := 0.98 // Increased threshold because wav2vec2 mean embeddings have very high baseline similarity
+	for _, results := range audioBatchResults {
+		if len(results) == 0 {
+			continue
+		}
+		top := results[0]
+		if float64(top.GetScore()) < audioThreshold {
+			continue
+		}
+		payload := top.GetPayload()
+		if payload == nil {
+			continue
+		}
+		parentVal, ok := payload["parent_sha256"]
+		if ok {
+			audioMatchCounts[parentVal.GetStringValue()]++
+		}
+	}
+
 	coverageUploadedPct := 0.0
 	if len(segments) > 0 {
 		coverageUploadedPct = float64(bestCount) / float64(len(segments)) * 100.0
@@ -515,11 +554,20 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 	}
 
 	isDeepfake := false
+	isAudioDeepfake := false
 	finalParent := ""
 	finalCoveragePct := 0.0
 	finalMatchedSegments := 0
 
 	if coverageUploadedPct >= 5.0 {
+		finalParent = bestParent
+		finalCoveragePct = coverageUploadedPct
+		finalMatchedSegments = bestCount
+		// If visual matches completely, but audio hash differs -> Audio deepfake!
+		if len(audioHash) > 0 && audioMatchCounts[finalParent] == 0 {
+			isDeepfake = true
+			isAudioDeepfake = true
+		}
 		finalParent = bestParent
 		finalCoveragePct = coverageUploadedPct
 		finalMatchedSegments = bestCount
@@ -549,12 +597,19 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 	}
 
 	similarity := (finalCoveragePct + coverageRegisteredPct) / 2.0
+	
+	// Penalize the similarity score if the video matches but the audio was swapped
+	if isAudioDeepfake {
+		similarity = similarity * 0.5
+	}
 
 	verified, txHash := s.crossCheckBlockchain(ctx, parentResult.Record.Sha256Hash, parentResult.Record.IpfsCid)
 
 	if parentResult.Record.WebhookUrl != "" {
 		msg := fmt.Sprintf("A matching segment of your registered asset (%s) was verified.", parentResult.Record.Sha256Hash)
-		if isDeepfake {
+		if isAudioDeepfake {
+			msg = fmt.Sprintf("ALERT: An Audio Deepfake (Voice Cloning) of your registered video (%s) was detected! The audio track has been manipulated.", parentResult.Record.Sha256Hash)
+		} else if isDeepfake {
 			msg = fmt.Sprintf("ALERT: A Deepfake/AI-altered version of your registered asset (%s) was detected!", parentResult.Record.Sha256Hash)
 		}
 		s.dispatcher.Dispatch(parentResult.Record.WebhookUrl, webhook.Payload{
@@ -579,6 +634,7 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 		OnChainVerified:         verified,
 		OnChainTxHash:           txHash,
 		IsDeepfake:              isDeepfake,
+		IsAudioDeepfake:         isAudioDeepfake,
 	}
 
 	_ = s.repo.SaveSegmentCache(ctx, cacheKey, result)
