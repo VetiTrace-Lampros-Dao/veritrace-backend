@@ -53,6 +53,7 @@ type SegmentVerificationResult struct {
 	OnChainVerified         bool                    `json:"on_chain_verified"`
 	OnChainTxHash           string                  `json:"on_chain_tx_hash,omitempty"`
 	IsDeepfake              bool                    `json:"is_deepfake"`
+	IsAudioDeepfake         bool                    `json:"is_audio_deepfake"`
 }
 
 type VerificationCertificate struct {
@@ -596,6 +597,11 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 	}
 
 	similarity := (finalCoveragePct + coverageRegisteredPct) / 2.0
+	
+	// Penalize the similarity score if the video matches but the audio was swapped
+	if isAudioDeepfake {
+		similarity = similarity * 0.5
+	}
 
 	verified, txHash := s.crossCheckBlockchain(ctx, parentResult.Record.Sha256Hash, parentResult.Record.IpfsCid)
 
@@ -628,6 +634,7 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 		OnChainVerified:         verified,
 		OnChainTxHash:           txHash,
 		IsDeepfake:              isDeepfake,
+		IsAudioDeepfake:         isAudioDeepfake,
 	}
 
 	_ = s.repo.SaveSegmentCache(ctx, cacheKey, result)
