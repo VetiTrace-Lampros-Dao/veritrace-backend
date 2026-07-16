@@ -397,7 +397,7 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 	vecs := make([][]float32, len(segments))
 	semVecs := make([][]float32, len(segments))
 	var faceVecs [][]float32 // Flattened array of all faces from all segments
-	
+
 	for i, seg := range segments {
 		vecs[i] = phashToVector(seg.PHash)
 		semVecs[i] = seg.SemanticHash
@@ -415,7 +415,7 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 	if err != nil {
 		log.Printf("SearchSemanticVectorsBatch failed: %v", err)
 	}
-	
+
 	var faceBatchResults [][]*pb.ScoredPoint
 	if len(faceVecs) > 0 {
 		faceBatchResults, err = s.repo.SearchFaceVectorsBatch(ctx, faceVecs, 1, pt)
@@ -548,7 +548,7 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 	if len(segments) > 0 {
 		semCoverageUploadedPct = float64(bestSemCount) / float64(len(segments)) * 100.0
 	}
-	
+
 	faceCoverageUploadedPct := 0.0
 	if len(segments) > 0 {
 		faceCoverageUploadedPct = float64(bestFaceCount) / float64(len(segments)) * 100.0
@@ -564,11 +564,20 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 		finalParent = bestParent
 		finalCoveragePct = coverageUploadedPct
 		finalMatchedSegments = bestCount
+		
+		log.Printf("DEBUG: Visual match found. finalParent=%s, len(audioHash)=%d, audioMatchCounts[finalParent]=%d", finalParent, len(audioHash), audioMatchCounts[finalParent])
+
 		// If visual matches completely, but audio hash differs -> Audio deepfake!
 		if len(audioHash) > 0 && audioMatchCounts[finalParent] == 0 {
+			log.Printf("DEBUG: Flagging Audio Deepfake!")
 			isDeepfake = true
 			isAudioDeepfake = true
+		} else if len(audioHash) == 0 {
+			log.Printf("DEBUG: Bypassing Audio Deepfake check because len(audioHash) == 0 (no audio detected in uploaded video)")
+		} else {
+			log.Printf("DEBUG: Not flagging Audio Deepfake because audioMatchCounts[finalParent] > 0")
 		}
+
 		finalParent = bestParent
 		finalCoveragePct = coverageUploadedPct
 		finalMatchedSegments = bestCount
@@ -598,7 +607,7 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 	}
 
 	similarity := (finalCoveragePct + coverageRegisteredPct) / 2.0
-	
+
 	// Penalize the similarity score if the video matches but the audio was swapped
 	if isAudioDeepfake {
 		similarity = similarity * 0.5
