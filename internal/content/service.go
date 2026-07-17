@@ -177,11 +177,15 @@ func (s *service) Register(ctx context.Context, record database.ContentRecord, k
 		}
 	}
 
-	if err := s.repo.SaveVectors(ctx, points); err != nil {
-		return fmt.Errorf("failed to index vectors: %w", err)
+	if len(points) > 0 {
+		if err := s.repo.SaveVectors(ctx, points); err != nil {
+			return fmt.Errorf("failed to index vectors: %w", err)
+		}
 	}
-	if err := s.repo.SaveSemanticVectors(ctx, semPoints); err != nil {
-		return fmt.Errorf("failed to index semantic vectors: %w", err)
+	if len(semPoints) > 0 {
+		if err := s.repo.SaveSemanticVectors(ctx, semPoints); err != nil {
+			return fmt.Errorf("failed to index semantic vectors: %w", err)
+		}
 	}
 	if len(facePoints) > 0 {
 		if err := s.repo.SaveFaceVectors(ctx, facePoints); err != nil {
