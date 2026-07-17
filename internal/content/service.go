@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"mime/multipart"
 	"net/http"
 	"time"
@@ -54,6 +55,7 @@ type SegmentVerificationResult struct {
 	OnChainTxHash           string                  `json:"on_chain_tx_hash,omitempty"`
 	IsDeepfake              bool                    `json:"is_deepfake"`
 	IsAudioDeepfake         bool                    `json:"is_audio_deepfake"`
+	TemporalIntegrity       float64                 `json:"temporal_integrity"`
 	DebugVersion            string                  `json:"debug_version,omitempty"`
 }
 
@@ -121,6 +123,7 @@ func (s *service) Register(ctx context.Context, record database.ContentRecord, k
 
 	var facePoints []*pb.PointStruct
 	var audioPoints []*pb.PointStruct
+	var textPoints []*pb.PointStruct
 
 	if mediaType == "document" {
 		points = append(points, s.buildPoint(record.Sha256Hash, record.CreatorAddress, record.PHash, 0, mediaType, "document"))
@@ -158,6 +161,10 @@ func (s *service) Register(ctx context.Context, record database.ContentRecord, k
 				}
 			}
 		}
+	} else if mediaType == "text" {
+		if sp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, rootSemanticHash, 0, mediaType, "text"); sp != nil {
+			textPoints = append(textPoints, sp)
+		}
 	} else {
 		points = append(points, s.buildPoint(record.Sha256Hash, record.CreatorAddress, record.PHash, 0, mediaType, "image"))
 		if sp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, rootSemanticHash, 0, mediaType, "image"); sp != nil {
@@ -184,6 +191,11 @@ func (s *service) Register(ctx context.Context, record database.ContentRecord, k
 	if len(audioPoints) > 0 {
 		if err := s.repo.SaveAudioVectors(ctx, audioPoints); err != nil {
 			log.Printf("Failed to index audio vectors: %v", err)
+		}
+	}
+	if len(textPoints) > 0 {
+		if err := s.repo.SaveTextVectors(ctx, textPoints); err != nil {
+			log.Printf("Failed to index text vectors: %v", err)
 		}
 	}
 
@@ -413,9 +425,17 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 		log.Printf("SearchVectorsBatch failed: %v", err)
 	}
 
-	semBatchResults, err := s.repo.SearchSemanticVectorsBatch(ctx, semVecs, 1, pt)
-	if err != nil {
-		log.Printf("SearchSemanticVectorsBatch failed: %v", err)
+	var semBatchResults [][]*pb.ScoredPoint
+	if mediaType == "text" {
+		semBatchResults, err = s.repo.SearchTextVectorsBatch(ctx, semVecs, 1, pt)
+		if err != nil {
+			log.Printf("SearchTextVectorsBatch failed: %v", err)
+		}
+	} else {
+		semBatchResults, err = s.repo.SearchSemanticVectorsBatch(ctx, semVecs, 1, pt)
+		if err != nil {
+			log.Printf("SearchSemanticVectorsBatch failed: %v", err)
+		}
 	}
 
 	var faceBatchResults [][]*pb.ScoredPoint
@@ -647,7 +667,61 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 		OnChainTxHash:           txHash,
 		IsDeepfake:              isDeepfake,
 		IsAudioDeepfake:         isAudioDeepfake,
+		TemporalIntegrity:       0.0,
 		DebugVersion:            "v2",
+	}
+
+	// Calculate Temporal Integrity using Dynamic Time Warping (DTW)
+	if finalMatchedSegments > 1 {
+		var uploadedOffsets []float64
+		var matchedOffsets []float64
+
+		// Extract matched timestamp offsets for the final parent
+		for i, results := range batchResults {
+			if len(results) == 0 {
+				continue
+			}
+			top := results[0]
+			if float64(top.GetScore()) > threshold {
+				continue
+			}
+			payload := top.GetPayload()
+			if payload == nil {
+				continue
+			}
+			parentVal, ok := payload["parent_sha256"]
+			if ok && parentVal.GetStringValue() == finalParent {
+				offsetVal, okOffset := payload["timestamp_offset"]
+				if okOffset {
+					uploadedOffsets = append(uploadedOffsets, float64(i))
+					matchedOffsets = append(matchedOffsets, float64(offsetVal.GetIntegerValue()))
+				}
+			}
+		}
+
+		if len(uploadedOffsets) > 1 && len(matchedOffsets) > 1 {
+			_ = dtwDistance(uploadedOffsets, matchedOffsets)
+			// Max possible distance if reversed is roughly length^2 / 2.
+			// For a perfect sequence, dist = constant shift difference.
+			// We calculate differences to normalize the shift.
+			shift := matchedOffsets[0] - uploadedOffsets[0]
+			normalizedDist := 0.0
+			for i := range matchedOffsets {
+				expected := uploadedOffsets[i] + shift
+				normalizedDist += math.Abs(matchedOffsets[i] - expected)
+			}
+			
+			// Dist is the sum of absolute errors. We convert to a percentage integrity score.
+			maxError := float64(len(matchedOffsets)) * float64(len(matchedOffsets))
+			integrity := 100.0 * (1.0 - (normalizedDist / maxError))
+			if integrity < 0 {
+				integrity = 0
+			}
+			if integrity > 100 {
+				integrity = 100
+			}
+			result.TemporalIntegrity = integrity
+		}
 	}
 
 	_ = s.repo.SaveSegmentCache(ctx, cacheKey, result)
@@ -660,6 +734,8 @@ func segmentPointType(mediaType string) string {
 		return "keyframe"
 	} else if mediaType == "document" {
 		return "page"
+	} else if mediaType == "text" {
+		return "text"
 	}
 	return "image"
 }
@@ -740,13 +816,35 @@ func (s *service) buildSemanticPoint(sha256, creator string, semanticHash []floa
 func phashToVector(phash uint64) []float32 {
 	vec := make([]float32, 64)
 	for i := 0; i < 64; i++ {
-		if (phash & (1 << uint(i))) != 0 {
+		if (phash & (1 << (63 - i))) != 0 {
 			vec[i] = 1.0
 		} else {
-			vec[i] = 0.0
+			vec[i] = -1.0
 		}
 	}
 	return vec
+}
+
+// dtwDistance calculates the Dynamic Time Warping distance between two sequences
+func dtwDistance(a, b []float64) float64 {
+	n := len(a)
+	m := len(b)
+	dtw := make([][]float64, n+1)
+	for i := range dtw {
+		dtw[i] = make([]float64, m+1)
+		for j := range dtw[i] {
+			dtw[i][j] = math.Inf(1)
+		}
+	}
+	dtw[0][0] = 0
+
+	for i := 1; i <= n; i++ {
+		for j := 1; j <= m; j++ {
+			cost := math.Abs(a[i-1] - b[j-1])
+			dtw[i][j] = cost + math.Min(dtw[i-1][j], math.Min(dtw[i][j-1], dtw[i-1][j-1]))
+		}
+	}
+	return dtw[n][m]
 }
 
 func generateUUID() string {
