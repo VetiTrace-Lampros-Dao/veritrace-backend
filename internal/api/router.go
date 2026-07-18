@@ -74,6 +74,7 @@ func SetupRouter(db *sql.DB, rdb *redis.Client, qdrant *vector.QdrantClient, cfg
 	
 	// Enterprise endpoints
 	r.GET("/api/v1/enterprise/dataset", enterpriseHandler.QueryDataset)
+	r.POST("/api/v1/enterprise/unlock", enterpriseHandler.UnlockDataset)
 
 	r.POST("/api/v1/dev/flush", func(c *gin.Context) {
 		_, err := db.Exec("TRUNCATE TABLE content_records, sync_checkpoints RESTART IDENTITY;")
