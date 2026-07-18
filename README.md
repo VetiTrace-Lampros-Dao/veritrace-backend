@@ -130,7 +130,7 @@ sequenceDiagram
 Create a `.env` file in the root directory (copy from `.env.example`):
 
 ```env
-CONTRACT_ADDRESS=0x468edc5b2fe9d1c919f2377cbe0ccb16f32ead29
+CONTRACT_ADDRESS=0xd5a4e9185cbcea881f2c76b07732335250537820
 PORT=8080
 
 DB_HOST=localhost
