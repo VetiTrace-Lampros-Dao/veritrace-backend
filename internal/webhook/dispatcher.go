@@ -13,6 +13,7 @@ type EventType string
 const (
 	EventMatchDetected      EventType = "MATCH_DETECTED"
 	EventDerivativeDetected EventType = "DERIVATIVE_DETECTED"
+	EventPlagiarismAlert    EventType = "PLAGIARISM_ALERT"
 )
 
 type Payload struct {

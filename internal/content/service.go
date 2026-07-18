@@ -110,6 +110,49 @@ func (s *service) SaveCheckpoint(ctx context.Context, key string, val uint64) er
 }
 
 func (s *service) Register(ctx context.Context, record database.ContentRecord, keyframes []KeyframePayload, mediaType string, rootSemanticHash []float32, rootFaceHashes [][]float32, rootAudioHash []float32) error {
+
+	var plagiarismCheck *SegmentVerificationResult
+	var fuzzyCheck *VerificationResult
+
+	if mediaType == "video" || mediaType == "document" || mediaType == "text" {
+		plagiarismCheck, _ = s.VerifySegments(ctx, record.Sha256Hash, keyframes, mediaType, rootAudioHash)
+	} else if mediaType == "image" {
+		fuzzyCheck, _ = s.VerifyFuzzy(ctx, record.PHash)
+	}
+
+	var matchFound bool
+	var matchedCreator string
+	var matchSimilarity float64
+	var matchedHash string
+	var matchedWebhook string
+
+	if plagiarismCheck != nil && plagiarismCheck.MatchFound {
+		matchFound = true
+		matchedCreator = plagiarismCheck.Record.CreatorAddress
+		matchSimilarity = plagiarismCheck.Similarity
+		matchedHash = plagiarismCheck.Record.Sha256Hash
+		matchedWebhook = plagiarismCheck.Record.WebhookUrl
+	} else if fuzzyCheck != nil && fuzzyCheck.MatchFound {
+		matchFound = true
+		matchedCreator = fuzzyCheck.Record.CreatorAddress
+		matchSimilarity = fuzzyCheck.Similarity
+		matchedHash = fuzzyCheck.Record.Sha256Hash
+		matchedWebhook = fuzzyCheck.Record.WebhookUrl
+	}
+
+	if matchFound && matchSimilarity >= 80.0 && matchedCreator != record.CreatorAddress {
+		if matchedWebhook != "" {
+			s.dispatcher.Dispatch(matchedWebhook, webhook.Payload{
+				EventType:    webhook.EventPlagiarismAlert,
+				OriginalHash: matchedHash,
+				Similarity:   matchSimilarity,
+				Timestamp:    time.Now().UTC().Format(time.RFC3339),
+				Message:      fmt.Sprintf("URGENT: A user (%s) has attempted to register content that is %.1f%% similar to your protected asset (%s) on the VeriTrace registry. This could be an attempt to plagiarize your work.", record.CreatorAddress, matchSimilarity, matchedHash),
+			})
+		}
+	}
+
+	// 2. Save to Postgres
 	if err := s.repo.SavePostgres(ctx, record); err != nil {
 		return fmt.Errorf("failed to save to postgres: %w", err)
 	}
@@ -217,7 +260,7 @@ func (s *service) VerifyExact(ctx context.Context, hash string) (*VerificationRe
 				OriginalHash: cached.Sha256Hash,
 				Similarity:   100.0,
 				Timestamp:    time.Now().UTC().Format(time.RFC3339),
-				Message:      fmt.Sprintf("An exact match of your registered asset (%s) was verified.", cached.Sha256Hash),
+				Message:      fmt.Sprintf("An exact match (100%% similarity) of your registered asset (%s) was verified by someone on the network.", cached.Sha256Hash),
 			})
 		}
 
@@ -252,7 +295,7 @@ func (s *service) VerifyExact(ctx context.Context, hash string) (*VerificationRe
 			OriginalHash: record.Sha256Hash,
 			Similarity:   100.0,
 			Timestamp:    time.Now().UTC().Format(time.RFC3339),
-			Message:      fmt.Sprintf("An exact match of your registered asset (%s) was verified.", record.Sha256Hash),
+			Message:      fmt.Sprintf("An exact match (100%% similarity) of your registered asset (%s) was verified by someone on the network.", record.Sha256Hash),
 		})
 	}
 
@@ -362,7 +405,7 @@ func (s *service) VerifyFuzzy(ctx context.Context, phash uint64) (*VerificationR
 			OriginalHash: recordResult.Record.Sha256Hash,
 			Similarity:   similarity,
 			Timestamp:    time.Now().UTC().Format(time.RFC3339),
-			Message:      fmt.Sprintf("A derivative copy of your registered asset (%s) was verified.", recordResult.Record.Sha256Hash),
+			Message:      fmt.Sprintf("A derivative copy of your registered asset (%s) was verified by someone on the network. The content was found to be %.1f%% similar to your original work.", recordResult.Record.Sha256Hash, similarity),
 		})
 	}
 
@@ -590,7 +633,7 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 		finalParent = bestParent
 		finalCoveragePct = coverageUploadedPct
 		finalMatchedSegments = bestCount
-		
+
 		log.Printf("DEBUG: Visual match found. finalParent=%s, len(audioHash)=%d, audioMatchCounts[finalParent]=%d", finalParent, len(audioHash), audioMatchCounts[finalParent])
 
 		// If visual matches completely, but audio hash differs -> Audio deepfake!
@@ -642,11 +685,11 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 	verified, txHash := s.crossCheckBlockchain(ctx, parentResult.Record.Sha256Hash, parentResult.Record.IpfsCid)
 
 	if parentResult.Record.WebhookUrl != "" {
-		msg := fmt.Sprintf("A matching segment of your registered asset (%s) was verified.", parentResult.Record.Sha256Hash)
+		msg := fmt.Sprintf("A matching segment of your registered asset (%s) was verified by someone on the network. The uploaded content is %.1f%% similar to your original work.", parentResult.Record.Sha256Hash, similarity)
 		if isAudioDeepfake {
-			msg = fmt.Sprintf("ALERT: An Audio Deepfake (Voice Cloning) of your registered video (%s) was detected! The audio track has been manipulated.", parentResult.Record.Sha256Hash)
+			msg = fmt.Sprintf("CRITICAL ALERT: An Audio Deepfake (Voice Cloning) of your registered video (%s) was detected during a verification check! The visual content matches, but the audio track has been maliciously manipulated.", parentResult.Record.Sha256Hash)
 		} else if isDeepfake {
-			msg = fmt.Sprintf("ALERT: A Deepfake/AI-altered version of your registered asset (%s) was detected!", parentResult.Record.Sha256Hash)
+			msg = fmt.Sprintf("CRITICAL ALERT: A Deepfake or AI-altered version of your registered asset (%s) was detected during a verification check!", parentResult.Record.Sha256Hash)
 		}
 		s.dispatcher.Dispatch(parentResult.Record.WebhookUrl, webhook.Payload{
 			EventType:    webhook.EventDerivativeDetected,
@@ -714,7 +757,7 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 				expected := uploadedOffsets[i] + shift
 				normalizedDist += math.Abs(matchedOffsets[i] - expected)
 			}
-			
+
 			// Dist is the sum of absolute errors. We convert to a percentage integrity score.
 			maxError := float64(len(matchedOffsets)) * float64(len(matchedOffsets))
 			integrity := 100.0 * (1.0 - (normalizedDist / maxError))
