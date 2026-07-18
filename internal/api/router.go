@@ -60,7 +60,7 @@ func SetupRouter(db *sql.DB, rdb *redis.Client, qdrant *vector.QdrantClient, cfg
 	contentService := content.NewService(contentRepo, cfg, storage, onchainVerifier, dispatcher)
 	contentHandler := content.NewHandler(contentService)
 
-	enterpriseHandler := NewEnterpriseHandler(db)
+	enterpriseHandler := NewEnterpriseHandler(db, qdrant)
 
 	r.GET("/health", healthHandler.CheckHealth)
 

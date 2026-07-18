@@ -28,6 +28,7 @@ type KeyframePayload struct {
 	PHash        uint64      `json:"phash"`
 	SemanticHash []float32   `json:"semantic_hash,omitempty"`
 	FaceHashes   [][]float32 `json:"face_hashes,omitempty"`
+	Caption      string      `json:"caption,omitempty"`
 }
 
 type VerificationResult struct {
@@ -71,7 +72,7 @@ type VerificationCertificate struct {
 }
 
 type Service interface {
-	Register(ctx context.Context, record database.ContentRecord, keyframes []KeyframePayload, mediaType string, rootSemanticHash []float32, rootFaceHashes [][]float32, rootAudioHash []float32) error
+	Register(ctx context.Context, record database.ContentRecord, keyframes []KeyframePayload, mediaType string, rootSemanticHash []float32, rootFaceHashes [][]float32, rootAudioHash []float32, caption string) error
 	VerifyExact(ctx context.Context, hash string) (*VerificationResult, error)
 	VerifyFuzzy(ctx context.Context, phash uint64) (*VerificationResult, error)
 	VerifySegments(ctx context.Context, sha256 string, segments []KeyframePayload, mediaType string, audioHash []float32) (*SegmentVerificationResult, error)
@@ -109,7 +110,7 @@ func (s *service) SaveCheckpoint(ctx context.Context, key string, val uint64) er
 	return s.repo.SaveCheckpoint(ctx, key, val)
 }
 
-func (s *service) Register(ctx context.Context, record database.ContentRecord, keyframes []KeyframePayload, mediaType string, rootSemanticHash []float32, rootFaceHashes [][]float32, rootAudioHash []float32) error {
+func (s *service) Register(ctx context.Context, record database.ContentRecord, keyframes []KeyframePayload, mediaType string, rootSemanticHash []float32, rootFaceHashes [][]float32, rootAudioHash []float32, caption string) error {
 
 	var plagiarismCheck *SegmentVerificationResult
 	var fuzzyCheck *VerificationResult
@@ -170,51 +171,51 @@ func (s *service) Register(ctx context.Context, record database.ContentRecord, k
 
 	if mediaType == "document" {
 		points = append(points, s.buildPoint(record.Sha256Hash, record.CreatorAddress, record.PHash, 0, mediaType, "document"))
-		if sp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, rootSemanticHash, 0, mediaType, "document"); sp != nil {
+		if sp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, rootSemanticHash, 0, mediaType, "document", caption); sp != nil {
 			semPoints = append(semPoints, sp)
 		}
 		for _, fh := range rootFaceHashes {
-			if fp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, fh, 0, mediaType, "document"); fp != nil {
+			if fp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, fh, 0, mediaType, "document", ""); fp != nil {
 				facePoints = append(facePoints, fp)
 			}
 		}
 		for _, kf := range keyframes {
 			points = append(points, s.buildPoint(record.Sha256Hash, record.CreatorAddress, kf.PHash, kf.Offset, mediaType, "page"))
-			if sp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, kf.SemanticHash, kf.Offset, mediaType, "page"); sp != nil {
+			if sp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, kf.SemanticHash, kf.Offset, mediaType, "page", kf.Caption); sp != nil {
 				semPoints = append(semPoints, sp)
 			}
 			for _, fh := range kf.FaceHashes {
-				if fp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, fh, kf.Offset, mediaType, "page"); fp != nil {
+				if fp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, fh, kf.Offset, mediaType, "page", ""); fp != nil {
 					facePoints = append(facePoints, fp)
 				}
 			}
 		}
 	} else if mediaType == "video" && len(keyframes) > 0 {
-		if ap := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, rootAudioHash, 0, mediaType, "video"); ap != nil {
+		if ap := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, rootAudioHash, 0, mediaType, "video", ""); ap != nil {
 			audioPoints = append(audioPoints, ap)
 		}
 		for _, kf := range keyframes {
 			points = append(points, s.buildPoint(record.Sha256Hash, record.CreatorAddress, kf.PHash, kf.Offset, mediaType, "keyframe"))
-			if sp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, kf.SemanticHash, kf.Offset, mediaType, "keyframe"); sp != nil {
+			if sp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, kf.SemanticHash, kf.Offset, mediaType, "keyframe", kf.Caption); sp != nil {
 				semPoints = append(semPoints, sp)
 			}
 			for _, fh := range kf.FaceHashes {
-				if fp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, fh, kf.Offset, mediaType, "keyframe"); fp != nil {
+				if fp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, fh, kf.Offset, mediaType, "keyframe", ""); fp != nil {
 					facePoints = append(facePoints, fp)
 				}
 			}
 		}
 	} else if mediaType == "text" {
-		if sp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, rootSemanticHash, 0, mediaType, "text"); sp != nil {
+		if sp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, rootSemanticHash, 0, mediaType, "text", ""); sp != nil {
 			textPoints = append(textPoints, sp)
 		}
 	} else {
 		points = append(points, s.buildPoint(record.Sha256Hash, record.CreatorAddress, record.PHash, 0, mediaType, "image"))
-		if sp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, rootSemanticHash, 0, mediaType, "image"); sp != nil {
+		if sp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, rootSemanticHash, 0, mediaType, "image", caption); sp != nil {
 			semPoints = append(semPoints, sp)
 		}
 		for _, fh := range rootFaceHashes {
-			if fp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, fh, 0, mediaType, "image"); fp != nil {
+			if fp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, fh, 0, mediaType, "image", ""); fp != nil {
 				facePoints = append(facePoints, fp)
 			}
 		}
@@ -835,7 +836,7 @@ func (s *service) buildPoint(sha256, creator string, phash, offset uint64, media
 	}
 }
 
-func (s *service) buildSemanticPoint(sha256, creator string, semanticHash []float32, offset uint64, mediaType, pointType string) *pb.PointStruct {
+func (s *service) buildSemanticPoint(sha256, creator string, semanticHash []float32, offset uint64, mediaType, pointType string, caption string) *pb.PointStruct {
 	if len(semanticHash) == 0 {
 		return nil
 	}
@@ -847,6 +848,10 @@ func (s *service) buildSemanticPoint(sha256, creator string, semanticHash []floa
 		"timestamp_offset": pb.NewValueInt(int64(offset)),
 		"media_type":       pb.NewValueString(mediaType),
 		"point_type":       pb.NewValueString(pointType),
+	}
+
+	if caption != "" {
+		payload["caption"] = pb.NewValueString(caption)
 	}
 
 	return &pb.PointStruct{

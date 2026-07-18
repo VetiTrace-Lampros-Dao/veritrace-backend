@@ -7,15 +7,18 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/internal/vector"
+	pb "github.com/qdrant/go-client/qdrant"
 	"github.com/gin-gonic/gin"
 )
 
 type EnterpriseHandler struct {
-	db *sql.DB
+	db     *sql.DB
+	qdrant *vector.QdrantClient
 }
 
-func NewEnterpriseHandler(db *sql.DB) *EnterpriseHandler {
-	return &EnterpriseHandler{db: db}
+func NewEnterpriseHandler(db *sql.DB, qdrant *vector.QdrantClient) *EnterpriseHandler {
+	return &EnterpriseHandler{db: db, qdrant: qdrant}
 }
 
 func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
@@ -85,6 +88,57 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 		amounts = append(amounts, amountInt.String())
 	}
 
+	semanticEmbeddings := make(map[string][]float32)
+	captions := make(map[string]string)
+	if len(hashes) > 0 && h.qdrant != nil {
+		var shouldConditions []*pb.Condition
+		for _, hash := range hashes {
+			shouldConditions = append(shouldConditions, &pb.Condition{
+				ConditionOneOf: &pb.Condition_Field{
+					Field: &pb.FieldCondition{
+						Key: "parent_sha256",
+						Match: &pb.Match{
+							MatchValue: &pb.Match_Keyword{
+								Keyword: hash,
+							},
+						},
+					},
+				},
+			})
+		}
+		
+		limit := uint32(len(hashes) * 2)
+		resp, err := h.qdrant.Points.Scroll(c.Request.Context(), &pb.ScrollPoints{
+			CollectionName: "veritrace_semantics",
+			Limit:          &limit,
+			WithPayload: &pb.WithPayloadSelector{
+				SelectorOptions: &pb.WithPayloadSelector_Enable{Enable: true},
+			},
+			WithVectors: &pb.WithVectorsSelector{
+				SelectorOptions: &pb.WithVectorsSelector_Enable{Enable: true},
+			},
+			Filter: &pb.Filter{
+				Should: shouldConditions,
+			},
+		})
+		
+		if err == nil && resp != nil {
+			for _, point := range resp.GetResult() {
+				if payload, ok := point.Payload["parent_sha256"]; ok {
+					parentHash := payload.GetStringValue()
+					if parentHash != "" && point.Vectors != nil {
+						if vec := point.Vectors.GetVector(); vec != nil {
+							semanticEmbeddings[parentHash] = vec.Data
+						}
+					}
+					if capPayload, ok := point.Payload["caption"]; ok {
+						captions[parentHash] = capPayload.GetStringValue()
+					}
+				}
+			}
+		}
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"total_items": totalFound,
 		"total_usdc":  totalUSDC,
@@ -92,6 +146,8 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 		"creators":    creators,
 		"amounts":     amounts,
 		"hashes":      hashes, // usually would be kept hidden until payment, but returning for demo purposes
+		"semantic_embeddings": semanticEmbeddings,
+		"captions":    captions,
 		"message":     fmt.Sprintf("Found %d items. Submit payment via smart contract to unlock high-res S3 URLs.", totalFound),
 	})
 }
