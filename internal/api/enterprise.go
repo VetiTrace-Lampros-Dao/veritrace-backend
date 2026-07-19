@@ -64,10 +64,12 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 			if err := json.Unmarshal(body, &aiRes); err == nil && len(aiRes.SemanticHash) > 0 {
 				// Query Qdrant with the embedding
 				limit := uint64(quantity * 2)
+				scoreThreshold := float32(0.22) // Require a minimum similarity score (Cosine similarity)
 				qResp, err := h.qdrant.Points.Search(c.Request.Context(), &pb.SearchPoints{
 					CollectionName: "veritrace_semantics",
 					Vector:         aiRes.SemanticHash,
 					Limit:          limit,
+					ScoreThreshold: &scoreThreshold,
 					WithPayload: &pb.WithPayloadSelector{
 						SelectorOptions: &pb.WithPayloadSelector_Enable{Enable: true},
 					},
