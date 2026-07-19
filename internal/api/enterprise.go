@@ -73,7 +73,7 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 			if err := json.Unmarshal(body, &aiRes); err == nil && len(aiRes.SemanticHash) > 0 {
 				// Query Qdrant with the embedding
 				limit := uint64(quantity * 2)
-				scoreThreshold := float32(0.28) // Increased threshold
+				scoreThreshold := float32(0.20) // Increased threshold
 				qResp, err := h.qdrant.Points.Search(c.Request.Context(), &pb.SearchPoints{
 					CollectionName: "veritrace_semantics",
 					Vector:         aiRes.SemanticHash,
