@@ -1,7 +1,10 @@
 package api
 
 import (
+	"bytes"
 	"database/sql"
+	"encoding/json"
+	"io"
 	"fmt"
 	"math/big"
 	"net/http"
@@ -24,6 +27,7 @@ func NewEnterpriseHandler(db *sql.DB, qdrant *vector.QdrantClient) *EnterpriseHa
 func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 	mediaType := c.Query("type")
 	quantityStr := c.Query("quantity")
+	searchQuery := c.Query("query")
 
 	if mediaType == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "media type is required"})
@@ -35,14 +39,89 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 		quantity = 100 // default
 	}
 
-	// Fetch up to 'quantity' items where AllowAiTraining is true
-	query := `
-		SELECT sha256_hash, creator_address
-		FROM content_records
-		WHERE media_type = $1 AND allow_ai_training = true
-		LIMIT $2;
-	`
-	rows, err := h.db.QueryContext(c.Request.Context(), query, mediaType, quantity)
+	var semanticHashes []string
+
+	// If a semantic search query is provided, fetch embedding and search Qdrant
+	if searchQuery != "" && h.qdrant != nil {
+		payload := map[string]string{"text": searchQuery}
+		payloadBytes, _ := json.Marshal(payload)
+
+		// Note: For production, this URL should be configurable via env
+		aiURL := "http://host.docker.internal:8082/api/v1/embed_text_clip"
+		req, _ := http.NewRequest("POST", aiURL, bytes.NewBuffer(payloadBytes))
+		req.Header.Set("Content-Type", "application/json")
+
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		
+		if err == nil && resp.StatusCode == 200 {
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(resp.Body)
+			
+			var aiRes struct {
+				SemanticHash []float32 `json:"semantic_hash"`
+			}
+			if err := json.Unmarshal(body, &aiRes); err == nil && len(aiRes.SemanticHash) > 0 {
+				// Query Qdrant with the embedding
+				limit := uint64(quantity * 2)
+				qResp, err := h.qdrant.Points.Search(c.Request.Context(), &pb.SearchPoints{
+					CollectionName: "veritrace_semantics",
+					Vector:         aiRes.SemanticHash,
+					Limit:          limit,
+					WithPayload: &pb.WithPayloadSelector{
+						SelectorOptions: &pb.WithPayloadSelector_Enable{Enable: true},
+					},
+				})
+				
+				if err == nil && qResp != nil {
+					for _, point := range qResp.GetResult() {
+						if payload, ok := point.Payload["parent_sha256"]; ok {
+							parentHash := payload.GetStringValue()
+							if parentHash != "" {
+								semanticHashes = append(semanticHashes, parentHash)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Fetch items from PostgreSQL
+	var query string
+	var args []interface{}
+
+	if len(semanticHashes) > 0 {
+		// Use semantic hashes to filter
+		var placeholders string
+		for i, hash := range semanticHashes {
+			args = append(args, hash)
+			if i > 0 {
+				placeholders += ", "
+			}
+			placeholders += fmt.Sprintf("$%d", i+1)
+		}
+		
+		query = fmt.Sprintf(`
+			SELECT sha256_hash, creator_address
+			FROM content_records
+			WHERE sha256_hash IN (%s) AND media_type = $%d AND allow_ai_training = true
+			LIMIT $%d;
+		`, placeholders, len(semanticHashes)+1, len(semanticHashes)+2)
+		
+		args = append(args, mediaType, quantity)
+	} else {
+		// Fallback to standard query if no search or no results
+		query = `
+			SELECT sha256_hash, creator_address
+			FROM content_records
+			WHERE media_type = $1 AND allow_ai_training = true
+			LIMIT $2;
+		`
+		args = []interface{}{mediaType, quantity}
+	}
+
+	rows, err := h.db.QueryContext(c.Request.Context(), query, args...)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to query database"})
 		return
@@ -65,13 +144,11 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 	}
 
 	if totalFound == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "no data found for this type"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "no data found for this query"})
 		return
 	}
 
 	// Math logic: $1 USDC per item. (We use $1 for easy math, but 0.95 after 5% fee)
-	// USDC has 6 decimals.
-	// Total price = totalFound * 1 USDC
 	totalUSDC := totalFound * 1000000 // 1 USDC = 1,000,000 units
 	fee := float64(totalUSDC) * 0.05
 	distributable := float64(totalUSDC) - fee
@@ -79,7 +156,7 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 	perItemAmount := distributable / float64(totalFound)
 
 	var creators []string
-	var amounts []string // String to prevent precision loss in JS
+	var amounts []string
 
 	for creator, count := range creatorCounts {
 		creators = append(creators, creator)
@@ -88,8 +165,10 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 		amounts = append(amounts, amountInt.String())
 	}
 
+	// Re-fetch vectors for the selected hashes to provide to the user
 	semanticEmbeddings := make(map[string][]float32)
 	captions := make(map[string]string)
+	
 	if len(hashes) > 0 && h.qdrant != nil {
 		var shouldConditions []*pb.Condition
 		for _, hash := range hashes {
@@ -139,16 +218,22 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 		}
 	}
 
+	message := fmt.Sprintf("Found %d items.", totalFound)
+	if searchQuery != "" {
+		message = fmt.Sprintf("Found %d items matching '%s'.", totalFound, searchQuery)
+	}
+	message += " Submit payment via smart contract to unlock high-res S3 URLs."
+
 	c.JSON(http.StatusOK, gin.H{
 		"total_items": totalFound,
 		"total_usdc":  totalUSDC,
 		"platform_fee": int64(fee),
 		"creators":    creators,
 		"amounts":     amounts,
-		"hashes":      hashes, // usually would be kept hidden until payment, but returning for demo purposes
+		"hashes":      hashes,
 		"semantic_embeddings": semanticEmbeddings,
 		"captions":    captions,
-		"message":     fmt.Sprintf("Found %d items. Submit payment via smart contract to unlock high-res S3 URLs.", totalFound),
+		"message":     message,
 	})
 }
 
