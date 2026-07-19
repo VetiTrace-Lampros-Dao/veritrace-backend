@@ -26,7 +26,8 @@ const contractABI = `[
 			{"indexed": false, "name": "phash", "type": "uint64"},
 			{"indexed": false, "name": "timestamp", "type": "uint64"},
 			{"indexed": false, "name": "ipfsCid", "type": "string"},
-			{"indexed": false, "name": "aitool", "type": "string"}
+			{"indexed": false, "name": "aitool", "type": "string"},
+			{"indexed": false, "name": "allowAiTraining", "type": "bool"}
 		],
 		"name": "ContentRegistered",
 		"type": "event"
@@ -40,6 +41,7 @@ type EventPayload struct {
 	Timestamp      uint64
 	IpfsCid        string
 	AiTool         string
+	AllowAiTraining bool
 }
 
 type EVMListener struct {
@@ -227,6 +229,7 @@ func (l *EVMListener) processLog(vLog types.Log, parsedABI abi.ABI) {
 		Timestamp uint64
 		IpfsCid   string
 		Aitool    string
+		AllowAiTraining bool
 	}
 
 	err := parsedABI.UnpackIntoInterface(&event, "ContentRegistered", vLog.Data)
@@ -252,5 +255,6 @@ func (l *EVMListener) processLog(vLog types.Log, parsedABI abi.ABI) {
 		Timestamp:      event.Timestamp,
 		IpfsCid:        event.IpfsCid,
 		AiTool:         event.Aitool,
+		AllowAiTraining: event.AllowAiTraining,
 	}
 }

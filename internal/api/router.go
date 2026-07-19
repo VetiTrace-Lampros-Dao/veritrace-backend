@@ -60,6 +60,8 @@ func SetupRouter(db *sql.DB, rdb *redis.Client, qdrant *vector.QdrantClient, cfg
 	contentService := content.NewService(contentRepo, cfg, storage, onchainVerifier, dispatcher)
 	contentHandler := content.NewHandler(contentService)
 
+	enterpriseHandler := NewEnterpriseHandler(db, qdrant)
+
 	r.GET("/health", healthHandler.CheckHealth)
 
 	r.GET("/api/v1/verify/exact", contentHandler.VerifyExact)
@@ -69,6 +71,10 @@ func SetupRouter(db *sql.DB, rdb *redis.Client, qdrant *vector.QdrantClient, cfg
 	r.POST("/api/v1/pin", contentHandler.PinToIPFS)
 	r.POST("/api/v1/pin-file", contentHandler.PinFile)
 	r.GET("/api/v1/content/:hash/lineage", contentHandler.GetLineage)
+	
+	// Enterprise endpoints
+	r.GET("/api/v1/enterprise/dataset", enterpriseHandler.QueryDataset)
+	r.POST("/api/v1/enterprise/unlock", enterpriseHandler.UnlockDataset)
 
 	r.POST("/api/v1/dev/flush", func(c *gin.Context) {
 		_, err := db.Exec("TRUNCATE TABLE content_records, sync_checkpoints RESTART IDENTITY;")

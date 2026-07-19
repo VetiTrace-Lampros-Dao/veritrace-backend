@@ -40,6 +40,7 @@ func InitQdrant(cfg *config.Config) (*QdrantClient, error) {
 	semExists := false
 	faceExists := false
 	audioExists := false
+	textExists := false
 	for _, coll := range listResp.GetCollections() {
 		if coll.GetName() == "veritrace_signatures" {
 			sigExists = true
@@ -52,6 +53,9 @@ func InitQdrant(cfg *config.Config) (*QdrantClient, error) {
 		}
 		if coll.GetName() == "veritrace_audio" {
 			audioExists = true
+		}
+		if coll.GetName() == "veritrace_text" {
+			textExists = true
 		}
 	}
 
@@ -174,6 +178,34 @@ func InitQdrant(cfg *config.Config) (*QdrantClient, error) {
 		if err != nil {
 			conn.Close()
 			return nil, fmt.Errorf("failed to create audio field index parent_sha256: %w", err)
+		}
+	}
+
+	if !textExists {
+		_, err = collectionsClient.Create(ctx, &pb.CreateCollection{
+			CollectionName: "veritrace_text",
+			VectorsConfig: &pb.VectorsConfig{
+				Config: &pb.VectorsConfig_Params{
+					Params: &pb.VectorParams{
+						Size:     384,
+						Distance: pb.Distance_Cosine,
+					},
+				},
+			},
+		})
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to create collection text: %w", err)
+		}
+
+		_, err = pointsClient.CreateFieldIndex(ctx, &pb.CreateFieldIndexCollection{
+			CollectionName: "veritrace_text",
+			FieldName:      "parent_sha256",
+			FieldType:      pb.FieldType_FieldTypeKeyword.Enum(),
+		})
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to create text field index parent_sha256: %w", err)
 		}
 	}
 

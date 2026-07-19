@@ -32,6 +32,7 @@ type MetadataJSON struct {
 	AllowAiTraining     bool              `json:"allow_ai_training"`
 	WebhookUrl          string            `json:"webhook_url"`
 	ParentSha256        string            `json:"parent_sha256"`
+	Caption             string            `json:"caption,omitempty"`
 	Keyframes           []KeyframePayload `json:"keyframes"`
 }
 
@@ -114,14 +115,16 @@ func (p *Pipeline) processEvent(ctx context.Context, event EventPayload) error {
 	var rootSemHash []float32
 	var rootFaceHashes [][]float32
 	var rootAudioHash []float32
+	var caption string
 	if meta != nil {
 		rootSemHash = meta.SemanticHash
 		rootFaceHashes = meta.FaceHashes
 		rootAudioHash = meta.AudioHash
 		mediaType = meta.MediaType
+		caption = meta.Caption
 	}
 
-	if err := p.contentService.Register(ctx, record, keyframes, mediaType, rootSemHash, rootFaceHashes, rootAudioHash); err != nil {
+	if err := p.contentService.Register(ctx, record, keyframes, mediaType, rootSemHash, rootFaceHashes, rootAudioHash, caption); err != nil {
 		return fmt.Errorf("failed to register content: %w", err)
 	}
 

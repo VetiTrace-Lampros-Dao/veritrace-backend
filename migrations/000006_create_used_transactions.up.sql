@@ -1,0 +1,4 @@
+CREATE TABLE IF NOT EXISTS used_transactions (
+    tx_hash VARCHAR(66) PRIMARY KEY,
+    unlocked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);

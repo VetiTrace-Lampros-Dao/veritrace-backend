@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"mime/multipart"
 	"net/http"
 	"time"
@@ -27,6 +28,7 @@ type KeyframePayload struct {
 	PHash        uint64      `json:"phash"`
 	SemanticHash []float32   `json:"semantic_hash,omitempty"`
 	FaceHashes   [][]float32 `json:"face_hashes,omitempty"`
+	Caption      string      `json:"caption,omitempty"`
 }
 
 type VerificationResult struct {
@@ -54,6 +56,7 @@ type SegmentVerificationResult struct {
 	OnChainTxHash           string                  `json:"on_chain_tx_hash,omitempty"`
 	IsDeepfake              bool                    `json:"is_deepfake"`
 	IsAudioDeepfake         bool                    `json:"is_audio_deepfake"`
+	TemporalIntegrity       float64                 `json:"temporal_integrity"`
 	DebugVersion            string                  `json:"debug_version,omitempty"`
 }
 
@@ -69,7 +72,7 @@ type VerificationCertificate struct {
 }
 
 type Service interface {
-	Register(ctx context.Context, record database.ContentRecord, keyframes []KeyframePayload, mediaType string, rootSemanticHash []float32, rootFaceHashes [][]float32, rootAudioHash []float32) error
+	Register(ctx context.Context, record database.ContentRecord, keyframes []KeyframePayload, mediaType string, rootSemanticHash []float32, rootFaceHashes [][]float32, rootAudioHash []float32, caption string) error
 	VerifyExact(ctx context.Context, hash string) (*VerificationResult, error)
 	VerifyFuzzy(ctx context.Context, phash uint64) (*VerificationResult, error)
 	VerifySegments(ctx context.Context, sha256 string, segments []KeyframePayload, mediaType string, audioHash []float32) (*SegmentVerificationResult, error)
@@ -107,7 +110,50 @@ func (s *service) SaveCheckpoint(ctx context.Context, key string, val uint64) er
 	return s.repo.SaveCheckpoint(ctx, key, val)
 }
 
-func (s *service) Register(ctx context.Context, record database.ContentRecord, keyframes []KeyframePayload, mediaType string, rootSemanticHash []float32, rootFaceHashes [][]float32, rootAudioHash []float32) error {
+func (s *service) Register(ctx context.Context, record database.ContentRecord, keyframes []KeyframePayload, mediaType string, rootSemanticHash []float32, rootFaceHashes [][]float32, rootAudioHash []float32, caption string) error {
+
+	var plagiarismCheck *SegmentVerificationResult
+	var fuzzyCheck *VerificationResult
+
+	if mediaType == "video" || mediaType == "document" || mediaType == "text" {
+		plagiarismCheck, _ = s.VerifySegments(ctx, record.Sha256Hash, keyframes, mediaType, rootAudioHash)
+	} else if mediaType == "image" {
+		fuzzyCheck, _ = s.VerifyFuzzy(ctx, record.PHash)
+	}
+
+	var matchFound bool
+	var matchedCreator string
+	var matchSimilarity float64
+	var matchedHash string
+	var matchedWebhook string
+
+	if plagiarismCheck != nil && plagiarismCheck.MatchFound {
+		matchFound = true
+		matchedCreator = plagiarismCheck.Record.CreatorAddress
+		matchSimilarity = plagiarismCheck.Similarity
+		matchedHash = plagiarismCheck.Record.Sha256Hash
+		matchedWebhook = plagiarismCheck.Record.WebhookUrl
+	} else if fuzzyCheck != nil && fuzzyCheck.MatchFound {
+		matchFound = true
+		matchedCreator = fuzzyCheck.Record.CreatorAddress
+		matchSimilarity = fuzzyCheck.Similarity
+		matchedHash = fuzzyCheck.Record.Sha256Hash
+		matchedWebhook = fuzzyCheck.Record.WebhookUrl
+	}
+
+	if matchFound && matchSimilarity >= 80.0 && matchedCreator != record.CreatorAddress {
+		if matchedWebhook != "" {
+			s.dispatcher.Dispatch(matchedWebhook, webhook.Payload{
+				EventType:    webhook.EventPlagiarismAlert,
+				OriginalHash: matchedHash,
+				Similarity:   matchSimilarity,
+				Timestamp:    time.Now().UTC().Format(time.RFC3339),
+				Message:      fmt.Sprintf("URGENT: A user (%s) has attempted to register content that is %.1f%% similar to your protected asset (%s) on the VeriTrace registry. This could be an attempt to plagiarize your work.", record.CreatorAddress, matchSimilarity, matchedHash),
+			})
+		}
+	}
+
+	// 2. Save to Postgres
 	if err := s.repo.SavePostgres(ctx, record); err != nil {
 		return fmt.Errorf("failed to save to postgres: %w", err)
 	}
@@ -121,60 +167,69 @@ func (s *service) Register(ctx context.Context, record database.ContentRecord, k
 
 	var facePoints []*pb.PointStruct
 	var audioPoints []*pb.PointStruct
+	var textPoints []*pb.PointStruct
 
 	if mediaType == "document" {
 		points = append(points, s.buildPoint(record.Sha256Hash, record.CreatorAddress, record.PHash, 0, mediaType, "document"))
-		if sp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, rootSemanticHash, 0, mediaType, "document"); sp != nil {
+		if sp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, rootSemanticHash, 0, mediaType, "document", caption); sp != nil {
 			semPoints = append(semPoints, sp)
 		}
 		for _, fh := range rootFaceHashes {
-			if fp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, fh, 0, mediaType, "document"); fp != nil {
+			if fp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, fh, 0, mediaType, "document", ""); fp != nil {
 				facePoints = append(facePoints, fp)
 			}
 		}
 		for _, kf := range keyframes {
 			points = append(points, s.buildPoint(record.Sha256Hash, record.CreatorAddress, kf.PHash, kf.Offset, mediaType, "page"))
-			if sp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, kf.SemanticHash, kf.Offset, mediaType, "page"); sp != nil {
+			if sp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, kf.SemanticHash, kf.Offset, mediaType, "page", kf.Caption); sp != nil {
 				semPoints = append(semPoints, sp)
 			}
 			for _, fh := range kf.FaceHashes {
-				if fp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, fh, kf.Offset, mediaType, "page"); fp != nil {
+				if fp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, fh, kf.Offset, mediaType, "page", ""); fp != nil {
 					facePoints = append(facePoints, fp)
 				}
 			}
 		}
 	} else if mediaType == "video" && len(keyframes) > 0 {
-		if ap := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, rootAudioHash, 0, mediaType, "video"); ap != nil {
+		if ap := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, rootAudioHash, 0, mediaType, "video", ""); ap != nil {
 			audioPoints = append(audioPoints, ap)
 		}
 		for _, kf := range keyframes {
 			points = append(points, s.buildPoint(record.Sha256Hash, record.CreatorAddress, kf.PHash, kf.Offset, mediaType, "keyframe"))
-			if sp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, kf.SemanticHash, kf.Offset, mediaType, "keyframe"); sp != nil {
+			if sp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, kf.SemanticHash, kf.Offset, mediaType, "keyframe", kf.Caption); sp != nil {
 				semPoints = append(semPoints, sp)
 			}
 			for _, fh := range kf.FaceHashes {
-				if fp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, fh, kf.Offset, mediaType, "keyframe"); fp != nil {
+				if fp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, fh, kf.Offset, mediaType, "keyframe", ""); fp != nil {
 					facePoints = append(facePoints, fp)
 				}
 			}
 		}
+	} else if mediaType == "text" {
+		if sp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, rootSemanticHash, 0, mediaType, "text", ""); sp != nil {
+			textPoints = append(textPoints, sp)
+		}
 	} else {
 		points = append(points, s.buildPoint(record.Sha256Hash, record.CreatorAddress, record.PHash, 0, mediaType, "image"))
-		if sp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, rootSemanticHash, 0, mediaType, "image"); sp != nil {
+		if sp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, rootSemanticHash, 0, mediaType, "image", caption); sp != nil {
 			semPoints = append(semPoints, sp)
 		}
 		for _, fh := range rootFaceHashes {
-			if fp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, fh, 0, mediaType, "image"); fp != nil {
+			if fp := s.buildSemanticPoint(record.Sha256Hash, record.CreatorAddress, fh, 0, mediaType, "image", ""); fp != nil {
 				facePoints = append(facePoints, fp)
 			}
 		}
 	}
 
-	if err := s.repo.SaveVectors(ctx, points); err != nil {
-		return fmt.Errorf("failed to index vectors: %w", err)
+	if len(points) > 0 {
+		if err := s.repo.SaveVectors(ctx, points); err != nil {
+			return fmt.Errorf("failed to index vectors: %w", err)
+		}
 	}
-	if err := s.repo.SaveSemanticVectors(ctx, semPoints); err != nil {
-		return fmt.Errorf("failed to index semantic vectors: %w", err)
+	if len(semPoints) > 0 {
+		if err := s.repo.SaveSemanticVectors(ctx, semPoints); err != nil {
+			return fmt.Errorf("failed to index semantic vectors: %w", err)
+		}
 	}
 	if len(facePoints) > 0 {
 		if err := s.repo.SaveFaceVectors(ctx, facePoints); err != nil {
@@ -184,6 +239,11 @@ func (s *service) Register(ctx context.Context, record database.ContentRecord, k
 	if len(audioPoints) > 0 {
 		if err := s.repo.SaveAudioVectors(ctx, audioPoints); err != nil {
 			log.Printf("Failed to index audio vectors: %v", err)
+		}
+	}
+	if len(textPoints) > 0 {
+		if err := s.repo.SaveTextVectors(ctx, textPoints); err != nil {
+			log.Printf("Failed to index text vectors: %v", err)
 		}
 	}
 
@@ -201,7 +261,7 @@ func (s *service) VerifyExact(ctx context.Context, hash string) (*VerificationRe
 				OriginalHash: cached.Sha256Hash,
 				Similarity:   100.0,
 				Timestamp:    time.Now().UTC().Format(time.RFC3339),
-				Message:      fmt.Sprintf("An exact match of your registered asset (%s) was verified.", cached.Sha256Hash),
+				Message:      fmt.Sprintf("An exact match (100%% similarity) of your registered asset (%s) was verified by someone on the network.", cached.Sha256Hash),
 			})
 		}
 
@@ -236,7 +296,7 @@ func (s *service) VerifyExact(ctx context.Context, hash string) (*VerificationRe
 			OriginalHash: record.Sha256Hash,
 			Similarity:   100.0,
 			Timestamp:    time.Now().UTC().Format(time.RFC3339),
-			Message:      fmt.Sprintf("An exact match of your registered asset (%s) was verified.", record.Sha256Hash),
+			Message:      fmt.Sprintf("An exact match (100%% similarity) of your registered asset (%s) was verified by someone on the network.", record.Sha256Hash),
 		})
 	}
 
@@ -346,7 +406,7 @@ func (s *service) VerifyFuzzy(ctx context.Context, phash uint64) (*VerificationR
 			OriginalHash: recordResult.Record.Sha256Hash,
 			Similarity:   similarity,
 			Timestamp:    time.Now().UTC().Format(time.RFC3339),
-			Message:      fmt.Sprintf("A derivative copy of your registered asset (%s) was verified.", recordResult.Record.Sha256Hash),
+			Message:      fmt.Sprintf("A derivative copy of your registered asset (%s) was verified by someone on the network. The content was found to be %.1f%% similar to your original work.", recordResult.Record.Sha256Hash, similarity),
 		})
 	}
 
@@ -413,9 +473,17 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 		log.Printf("SearchVectorsBatch failed: %v", err)
 	}
 
-	semBatchResults, err := s.repo.SearchSemanticVectorsBatch(ctx, semVecs, 1, pt)
-	if err != nil {
-		log.Printf("SearchSemanticVectorsBatch failed: %v", err)
+	var semBatchResults [][]*pb.ScoredPoint
+	if mediaType == "text" {
+		semBatchResults, err = s.repo.SearchTextVectorsBatch(ctx, semVecs, 1, pt)
+		if err != nil {
+			log.Printf("SearchTextVectorsBatch failed: %v", err)
+		}
+	} else {
+		semBatchResults, err = s.repo.SearchSemanticVectorsBatch(ctx, semVecs, 1, pt)
+		if err != nil {
+			log.Printf("SearchSemanticVectorsBatch failed: %v", err)
+		}
 	}
 
 	var faceBatchResults [][]*pb.ScoredPoint
@@ -566,7 +634,7 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 		finalParent = bestParent
 		finalCoveragePct = coverageUploadedPct
 		finalMatchedSegments = bestCount
-		
+
 		log.Printf("DEBUG: Visual match found. finalParent=%s, len(audioHash)=%d, audioMatchCounts[finalParent]=%d", finalParent, len(audioHash), audioMatchCounts[finalParent])
 
 		// If visual matches completely, but audio hash differs -> Audio deepfake!
@@ -618,11 +686,11 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 	verified, txHash := s.crossCheckBlockchain(ctx, parentResult.Record.Sha256Hash, parentResult.Record.IpfsCid)
 
 	if parentResult.Record.WebhookUrl != "" {
-		msg := fmt.Sprintf("A matching segment of your registered asset (%s) was verified.", parentResult.Record.Sha256Hash)
+		msg := fmt.Sprintf("A matching segment of your registered asset (%s) was verified by someone on the network. The uploaded content is %.1f%% similar to your original work.", parentResult.Record.Sha256Hash, similarity)
 		if isAudioDeepfake {
-			msg = fmt.Sprintf("ALERT: An Audio Deepfake (Voice Cloning) of your registered video (%s) was detected! The audio track has been manipulated.", parentResult.Record.Sha256Hash)
+			msg = fmt.Sprintf("CRITICAL ALERT: An Audio Deepfake (Voice Cloning) of your registered video (%s) was detected during a verification check! The visual content matches, but the audio track has been maliciously manipulated.", parentResult.Record.Sha256Hash)
 		} else if isDeepfake {
-			msg = fmt.Sprintf("ALERT: A Deepfake/AI-altered version of your registered asset (%s) was detected!", parentResult.Record.Sha256Hash)
+			msg = fmt.Sprintf("CRITICAL ALERT: A Deepfake or AI-altered version of your registered asset (%s) was detected during a verification check!", parentResult.Record.Sha256Hash)
 		}
 		s.dispatcher.Dispatch(parentResult.Record.WebhookUrl, webhook.Payload{
 			EventType:    webhook.EventDerivativeDetected,
@@ -647,7 +715,61 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 		OnChainTxHash:           txHash,
 		IsDeepfake:              isDeepfake,
 		IsAudioDeepfake:         isAudioDeepfake,
+		TemporalIntegrity:       0.0,
 		DebugVersion:            "v2",
+	}
+
+	// Calculate Temporal Integrity using Dynamic Time Warping (DTW)
+	if finalMatchedSegments > 1 {
+		var uploadedOffsets []float64
+		var matchedOffsets []float64
+
+		// Extract matched timestamp offsets for the final parent
+		for i, results := range batchResults {
+			if len(results) == 0 {
+				continue
+			}
+			top := results[0]
+			if float64(top.GetScore()) > threshold {
+				continue
+			}
+			payload := top.GetPayload()
+			if payload == nil {
+				continue
+			}
+			parentVal, ok := payload["parent_sha256"]
+			if ok && parentVal.GetStringValue() == finalParent {
+				offsetVal, okOffset := payload["timestamp_offset"]
+				if okOffset {
+					uploadedOffsets = append(uploadedOffsets, float64(i))
+					matchedOffsets = append(matchedOffsets, float64(offsetVal.GetIntegerValue()))
+				}
+			}
+		}
+
+		if len(uploadedOffsets) > 1 && len(matchedOffsets) > 1 {
+			_ = dtwDistance(uploadedOffsets, matchedOffsets)
+			// Max possible distance if reversed is roughly length^2 / 2.
+			// For a perfect sequence, dist = constant shift difference.
+			// We calculate differences to normalize the shift.
+			shift := matchedOffsets[0] - uploadedOffsets[0]
+			normalizedDist := 0.0
+			for i := range matchedOffsets {
+				expected := uploadedOffsets[i] + shift
+				normalizedDist += math.Abs(matchedOffsets[i] - expected)
+			}
+
+			// Dist is the sum of absolute errors. We convert to a percentage integrity score.
+			maxError := float64(len(matchedOffsets)) * float64(len(matchedOffsets))
+			integrity := 100.0 * (1.0 - (normalizedDist / maxError))
+			if integrity < 0 {
+				integrity = 0
+			}
+			if integrity > 100 {
+				integrity = 100
+			}
+			result.TemporalIntegrity = integrity
+		}
 	}
 
 	_ = s.repo.SaveSegmentCache(ctx, cacheKey, result)
@@ -660,6 +782,8 @@ func segmentPointType(mediaType string) string {
 		return "keyframe"
 	} else if mediaType == "document" {
 		return "page"
+	} else if mediaType == "text" {
+		return "text"
 	}
 	return "image"
 }
@@ -712,7 +836,7 @@ func (s *service) buildPoint(sha256, creator string, phash, offset uint64, media
 	}
 }
 
-func (s *service) buildSemanticPoint(sha256, creator string, semanticHash []float32, offset uint64, mediaType, pointType string) *pb.PointStruct {
+func (s *service) buildSemanticPoint(sha256, creator string, semanticHash []float32, offset uint64, mediaType, pointType string, caption string) *pb.PointStruct {
 	if len(semanticHash) == 0 {
 		return nil
 	}
@@ -724,6 +848,10 @@ func (s *service) buildSemanticPoint(sha256, creator string, semanticHash []floa
 		"timestamp_offset": pb.NewValueInt(int64(offset)),
 		"media_type":       pb.NewValueString(mediaType),
 		"point_type":       pb.NewValueString(pointType),
+	}
+
+	if caption != "" {
+		payload["caption"] = pb.NewValueString(caption)
 	}
 
 	return &pb.PointStruct{
@@ -740,13 +868,35 @@ func (s *service) buildSemanticPoint(sha256, creator string, semanticHash []floa
 func phashToVector(phash uint64) []float32 {
 	vec := make([]float32, 64)
 	for i := 0; i < 64; i++ {
-		if (phash & (1 << uint(i))) != 0 {
+		if (phash & (1 << (63 - i))) != 0 {
 			vec[i] = 1.0
 		} else {
-			vec[i] = 0.0
+			vec[i] = -1.0
 		}
 	}
 	return vec
+}
+
+// dtwDistance calculates the Dynamic Time Warping distance between two sequences
+func dtwDistance(a, b []float64) float64 {
+	n := len(a)
+	m := len(b)
+	dtw := make([][]float64, n+1)
+	for i := range dtw {
+		dtw[i] = make([]float64, m+1)
+		for j := range dtw[i] {
+			dtw[i][j] = math.Inf(1)
+		}
+	}
+	dtw[0][0] = 0
+
+	for i := 1; i <= n; i++ {
+		for j := 1; j <= m; j++ {
+			cost := math.Abs(a[i-1] - b[j-1])
+			dtw[i][j] = cost + math.Min(dtw[i-1][j], math.Min(dtw[i][j-1], dtw[i-1][j-1]))
+		}
+	}
+	return dtw[n][m]
 }
 
 func generateUUID() string {
