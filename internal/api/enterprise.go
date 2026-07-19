@@ -64,7 +64,7 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 			if err := json.Unmarshal(body, &aiRes); err == nil && len(aiRes.SemanticHash) > 0 {
 				// Query Qdrant with the embedding
 				limit := uint64(quantity * 2)
-				scoreThreshold := float32(0.22) // Require a minimum similarity score (Cosine similarity)
+				scoreThreshold := float32(0.28) // Increased threshold for stricter matching
 				qResp, err := h.qdrant.Points.Search(c.Request.Context(), &pb.SearchPoints{
 					CollectionName: "veritrace_semantics",
 					Vector:         aiRes.SemanticHash,
@@ -90,12 +90,19 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 	}
 
 	// Fetch items from PostgreSQL
-	var query string
-	var args []interface{}
+	creatorCounts := make(map[string]int)
+	totalFound := 0
+	var hashes []string
 
-	if len(semanticHashes) > 0 {
+	if searchQuery != "" {
+		if len(semanticHashes) == 0 {
+			c.JSON(http.StatusNotFound, gin.H{"error": "no data found for this query"})
+			return
+		}
+
 		// Use semantic hashes to filter
 		var placeholders string
+		var args []interface{}
 		for i, hash := range semanticHashes {
 			args = append(args, hash)
 			if i > 0 {
@@ -104,45 +111,67 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 			placeholders += fmt.Sprintf("$%d", i+1)
 		}
 		
-		query = fmt.Sprintf(`
+		// Do not limit here, we will preserve Qdrant's ordering in Go
+		query := fmt.Sprintf(`
 			SELECT sha256_hash, creator_address
 			FROM content_records
 			WHERE sha256_hash IN (%s) AND media_type = $%d AND allow_ai_training = true
-			LIMIT $%d;
-		`, placeholders, len(semanticHashes)+1, len(semanticHashes)+2)
+		`, placeholders, len(semanticHashes)+1)
 		
-		args = append(args, mediaType, quantity)
+		args = append(args, mediaType)
+
+		rows, err := h.db.QueryContext(c.Request.Context(), query, args...)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to query database"})
+			return
+		}
+		defer rows.Close()
+
+		// Map to store DB results
+		dbResults := make(map[string]string)
+		for rows.Next() {
+			var hash, creator string
+			if err := rows.Scan(&hash, &creator); err == nil {
+				dbResults[hash] = creator
+			}
+		}
+
+		// Iterate through Qdrant's ordered hashes to preserve similarity ranking
+		for _, qHash := range semanticHashes {
+			if creator, exists := dbResults[qHash]; exists {
+				creatorCounts[creator]++
+				hashes = append(hashes, qHash)
+				totalFound++
+				if totalFound == quantity {
+					break
+				}
+			}
+		}
 	} else {
-		// Fallback to standard query if no search or no results
-		query = `
+		// Fallback to standard query if no search
+		query := `
 			SELECT sha256_hash, creator_address
 			FROM content_records
 			WHERE media_type = $1 AND allow_ai_training = true
 			LIMIT $2;
 		`
-		args = []interface{}{mediaType, quantity}
-	}
-
-	rows, err := h.db.QueryContext(c.Request.Context(), query, args...)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to query database"})
-		return
-	}
-	defer rows.Close()
-
-	creatorCounts := make(map[string]int)
-	totalFound := 0
-
-	var hashes []string
-
-	for rows.Next() {
-		var hash, creator string
-		if err := rows.Scan(&hash, &creator); err != nil {
-			continue
+		args := []interface{}{mediaType, quantity}
+		rows, err := h.db.QueryContext(c.Request.Context(), query, args...)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to query database"})
+			return
 		}
-		creatorCounts[creator]++
-		hashes = append(hashes, hash)
-		totalFound++
+		defer rows.Close()
+
+		for rows.Next() {
+			var hash, creator string
+			if err := rows.Scan(&hash, &creator); err != nil {
+				continue
+			}
+			creatorCounts[creator]++
+			hashes = append(hashes, hash)
+			totalFound++
+		}
 	}
 
 	if totalFound == 0 {
