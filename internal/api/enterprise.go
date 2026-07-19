@@ -41,12 +41,13 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 
 	var semanticHashes []string
 
-	// If a semantic search query is provided, fetch embedding and search Qdrant
+	// Map to track actual Qdrant scores for debugging
+	debugScores := make(map[string]float32)
+
 	if searchQuery != "" && h.qdrant != nil {
 		payload := map[string]string{"text": searchQuery}
 		payloadBytes, _ := json.Marshal(payload)
 
-		// Note: For production, this URL should be configurable via env
 		aiURL := "http://host.docker.internal:8082/api/v1/embed_text_clip"
 		req, _ := http.NewRequest("POST", aiURL, bytes.NewBuffer(payloadBytes))
 		req.Header.Set("Content-Type", "application/json")
@@ -62,9 +63,8 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 				SemanticHash []float32 `json:"semantic_hash"`
 			}
 			if err := json.Unmarshal(body, &aiRes); err == nil && len(aiRes.SemanticHash) > 0 {
-				// Query Qdrant with the embedding
 				limit := uint64(quantity * 2)
-				scoreThreshold := float32(0.28) // Increased threshold for stricter matching
+				scoreThreshold := float32(0.28)
 				qResp, err := h.qdrant.Points.Search(c.Request.Context(), &pb.SearchPoints{
 					CollectionName: "veritrace_semantics",
 					Vector:         aiRes.SemanticHash,
@@ -81,6 +81,7 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 							parentHash := payload.GetStringValue()
 							if parentHash != "" {
 								semanticHashes = append(semanticHashes, parentHash)
+								debugScores[parentHash] = point.Score // Track the score!
 							}
 						}
 					}
@@ -265,6 +266,7 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 		"semantic_embeddings": semanticEmbeddings,
 		"captions":    captions,
 		"message":     message,
+		"debug_scores": debugScores, // Return Qdrant scores for debugging!
 	})
 }
 
