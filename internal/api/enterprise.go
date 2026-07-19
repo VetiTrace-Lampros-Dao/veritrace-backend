@@ -8,6 +8,7 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"os"
 	"strconv"
 
 	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/internal/vector"
@@ -21,7 +22,10 @@ type EnterpriseHandler struct {
 }
 
 func NewEnterpriseHandler(db *sql.DB, qdrant *vector.QdrantClient) *EnterpriseHandler {
-	return &EnterpriseHandler{db: db, qdrant: qdrant}
+	return &EnterpriseHandler{
+		db:     db,
+		qdrant: qdrant,
+	}
 }
 
 func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
@@ -40,31 +44,36 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 	}
 
 	var semanticHashes []string
+	debugScores := make(map[string]float32)
 
 	// If a semantic search query is provided, fetch embedding and search Qdrant
 	if searchQuery != "" && h.qdrant != nil {
 		payload := map[string]string{"text": searchQuery}
 		payloadBytes, _ := json.Marshal(payload)
 
-		// Note: For production, this URL should be configurable via env
-		aiURL := "http://host.docker.internal:8082/api/v1/embed_text_clip"
+		aiServiceURL := os.Getenv("AI_SERVICE_URL")
+		if aiServiceURL == "" {
+			aiServiceURL = "http://host.docker.internal:8082" // default for local mac
+		}
+		aiURL := aiServiceURL + "/api/v1/embed_text_clip"
+
 		req, _ := http.NewRequest("POST", aiURL, bytes.NewBuffer(payloadBytes))
 		req.Header.Set("Content-Type", "application/json")
 
 		client := &http.Client{}
 		resp, err := client.Do(req)
-
+		
 		if err == nil && resp.StatusCode == 200 {
 			defer resp.Body.Close()
 			body, _ := io.ReadAll(resp.Body)
-
+			
 			var aiRes struct {
 				SemanticHash []float32 `json:"semantic_hash"`
 			}
 			if err := json.Unmarshal(body, &aiRes); err == nil && len(aiRes.SemanticHash) > 0 {
 				// Query Qdrant with the embedding
 				limit := uint64(quantity * 2)
-				scoreThreshold := float32(0.22) // Require a minimum similarity score (Cosine similarity)
+				scoreThreshold := float32(0.28) // Increased threshold
 				qResp, err := h.qdrant.Points.Search(c.Request.Context(), &pb.SearchPoints{
 					CollectionName: "veritrace_semantics",
 					Vector:         aiRes.SemanticHash,
@@ -74,13 +83,14 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 						SelectorOptions: &pb.WithPayloadSelector_Enable{Enable: true},
 					},
 				})
-
+				
 				if err == nil && qResp != nil {
 					for _, point := range qResp.GetResult() {
 						if payload, ok := point.Payload["parent_sha256"]; ok {
 							parentHash := payload.GetStringValue()
 							if parentHash != "" {
 								semanticHashes = append(semanticHashes, parentHash)
+								debugScores[parentHash] = point.Score
 							}
 						}
 					}
@@ -90,12 +100,19 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 	}
 
 	// Fetch items from PostgreSQL
-	var query string
-	var args []interface{}
+	creatorCounts := make(map[string]int)
+	totalFound := 0
+	var hashes []string
 
-	if len(semanticHashes) > 0 {
+	if searchQuery != "" {
+		if len(semanticHashes) == 0 {
+			c.JSON(http.StatusNotFound, gin.H{"error": "no data found for this query"})
+			return
+		}
+
 		// Use semantic hashes to filter
 		var placeholders string
+		var args []interface{}
 		for i, hash := range semanticHashes {
 			args = append(args, hash)
 			if i > 0 {
@@ -103,51 +120,76 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 			}
 			placeholders += fmt.Sprintf("$%d", i+1)
 		}
-
-		query = fmt.Sprintf(`
+		
+		query := fmt.Sprintf(`
 			SELECT sha256_hash, creator_address
 			FROM content_records
 			WHERE sha256_hash IN (%s) AND media_type = $%d AND allow_ai_training = true
-			LIMIT $%d;
-		`, placeholders, len(semanticHashes)+1, len(semanticHashes)+2)
+		`, placeholders, len(semanticHashes)+1)
+		
+		args = append(args, mediaType)
 
-		args = append(args, mediaType, quantity)
+		rows, err := h.db.QueryContext(c.Request.Context(), query, args...)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to query database"})
+			return
+		}
+		defer rows.Close()
+
+		dbResults := make(map[string]string)
+		for rows.Next() {
+			var hash, creator string
+			if err := rows.Scan(&hash, &creator); err == nil {
+				dbResults[hash] = creator
+			}
+		}
+
+		for _, qHash := range semanticHashes {
+			if creator, exists := dbResults[qHash]; exists {
+				creatorCounts[creator]++
+				hashes = append(hashes, qHash)
+				totalFound++
+				if totalFound == quantity {
+					break
+				}
+			}
+		}
+
+		if totalFound == 0 {
+			c.JSON(http.StatusNotFound, gin.H{"error": "no data found for this query"})
+			return
+		}
+
 	} else {
-		// Fallback to standard query if no search or no results
-		query = `
+		// Fallback to standard query if no search
+		query := `
 			SELECT sha256_hash, creator_address
 			FROM content_records
 			WHERE media_type = $1 AND allow_ai_training = true
 			LIMIT $2;
 		`
-		args = []interface{}{mediaType, quantity}
-	}
-
-	rows, err := h.db.QueryContext(c.Request.Context(), query, args...)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to query database"})
-		return
-	}
-	defer rows.Close()
-
-	creatorCounts := make(map[string]int)
-	totalFound := 0
-
-	var hashes []string
-
-	for rows.Next() {
-		var hash, creator string
-		if err := rows.Scan(&hash, &creator); err != nil {
-			continue
+		args := []interface{}{mediaType, quantity}
+		rows, err := h.db.QueryContext(c.Request.Context(), query, args...)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to query database"})
+			return
 		}
-		creatorCounts[creator]++
-		hashes = append(hashes, hash)
-		totalFound++
-	}
+		defer rows.Close()
 
-	if totalFound == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "no data found for this query"})
-		return
+		for rows.Next() {
+			var hash, creator string
+			if err := rows.Scan(&hash, &creator); err != nil {
+				continue
+			}
+			creatorCounts[creator]++
+			hashes = append(hashes, hash)
+			totalFound++
+		}
+
+		if totalFound == 0 {
+			c.JSON(http.StatusNotFound, gin.H{"error": "no data found for this query"})
+			return
+		}
 	}
 
 	// Math logic: $1 USDC per item. (We use $1 for easy math, but 0.95 after 5% fee)
@@ -170,7 +212,7 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 	// Re-fetch vectors for the selected hashes to provide to the user
 	semanticEmbeddings := make(map[string][]float32)
 	captions := make(map[string]string)
-
+	
 	if len(hashes) > 0 && h.qdrant != nil {
 		var shouldConditions []*pb.Condition
 		for _, hash := range hashes {
@@ -187,7 +229,7 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 				},
 			})
 		}
-
+		
 		limit := uint32(len(hashes) * 2)
 		resp, err := h.qdrant.Points.Scroll(c.Request.Context(), &pb.ScrollPoints{
 			CollectionName: "veritrace_semantics",
@@ -202,7 +244,7 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 				Should: shouldConditions,
 			},
 		})
-
+		
 		if err == nil && resp != nil {
 			for _, point := range resp.GetResult() {
 				if payload, ok := point.Payload["parent_sha256"]; ok {
@@ -227,15 +269,16 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 	message += " Submit payment via smart contract to unlock high-res S3 URLs."
 
 	c.JSON(http.StatusOK, gin.H{
-		"total_items":         totalFound,
-		"total_usdc":          totalUSDC,
-		"platform_fee":        int64(fee),
-		"creators":            creators,
-		"amounts":             amounts,
-		"hashes":              hashes,
+		"total_items": totalFound,
+		"total_usdc":  totalUSDC,
+		"platform_fee": int64(fee),
+		"creators":    creators,
+		"amounts":     amounts,
+		"hashes":      hashes,
 		"semantic_embeddings": semanticEmbeddings,
-		"captions":            captions,
-		"message":             message,
+		"captions":    captions,
+		"message":     message,
+		"debug_scores": debugScores,
 	})
 }
 
@@ -251,39 +294,21 @@ func (h *EnterpriseHandler) UnlockDataset(c *gin.Context) {
 		return
 	}
 
-	// 1. Check if txHash has already been used
-	var exists bool
-	err := h.db.QueryRowContext(c.Request.Context(), "SELECT EXISTS(SELECT 1 FROM used_transactions WHERE tx_hash = $1)", req.TxHash).Scan(&exists)
+	// Verify the payment on the Arbitrum Sepolia contract
+	valid, err := h.verifyPayment(req.TxHash, req.Hashes)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "database error checking transaction"})
-		return
-	}
-	if exists {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Transaction hash already used to unlock a dataset"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify payment: " + err.Error()})
 		return
 	}
 
-	// 2. Mark txHash as used
-	_, err = h.db.ExecContext(c.Request.Context(), "INSERT INTO used_transactions (tx_hash) VALUES ($1)", req.TxHash)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to record transaction"})
+	if !valid {
+		c.JSON(http.StatusPaymentRequired, gin.H{"error": "payment verification failed or insufficient amount"})
 		return
 	}
 
-	// 3. Fetch S3 URLs for the provided hashes
-	if len(req.Hashes) == 0 {
-		c.JSON(http.StatusOK, gin.H{"links": []string{}})
-		return
-	}
-
-	// Build query for multiple hashes
-	query := "SELECT media_s3_url FROM content_records WHERE sha256_hash = ANY($1)"
-
-	// Convert Go slice to a PostgreSQL array string or use pq.Array (but pq is imported in database, not here)
-	// Alternatively, iterate over hashes and build IN clause (or use pq.Array if imported).
-	// For simplicity in gin handlers, we can build the query with numbered parameters:
-	var args []interface{}
+	// If valid, return the high-res S3 URLs
 	var placeholders string
+	var args []interface{}
 	for i, hash := range req.Hashes {
 		args = append(args, hash)
 		if i > 0 {
@@ -292,29 +317,56 @@ func (h *EnterpriseHandler) UnlockDataset(c *gin.Context) {
 		placeholders += fmt.Sprintf("$%d", i+1)
 	}
 
-	query = fmt.Sprintf("SELECT sha256_hash, media_s3_url FROM content_records WHERE sha256_hash IN (%s)", placeholders)
+	query := fmt.Sprintf(`
+		SELECT sha256_hash, s3_url
+		FROM content_records
+		WHERE sha256_hash IN (%s)
+	`, placeholders)
+
 	rows, err := h.db.QueryContext(c.Request.Context(), query, args...)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch S3 links"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to query database for URLs"})
 		return
 	}
 	defer rows.Close()
 
-	type UnlockResult struct {
-		Hash  string `json:"hash"`
-		S3Url string `json:"s3_url"`
-	}
-
-	var results []UnlockResult
+	urls := make(map[string]string)
 	for rows.Next() {
-		var hash, s3Url string
-		if err := rows.Scan(&hash, &s3Url); err == nil {
-			results = append(results, UnlockResult{Hash: hash, S3Url: s3Url})
+		var hash, url string
+		if err := rows.Scan(&hash, &url); err == nil {
+			urls[hash] = url
 		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"message": "Dataset successfully unlocked!",
-		"links":   results,
+		"message": "Payment verified successfully. High-res datasets unlocked.",
+		"urls":    urls,
 	})
+}
+
+func (h *EnterpriseHandler) verifyPayment(txHash string, hashes []string) (bool, error) {
+	// 1 USDC = 1,000,000 units on our contract
+	expectedCost := int64(len(hashes) * 1000000)
+	
+	// Check against the postgres tx cache directly for instant verification
+	var totalPaid int64
+	err := h.db.QueryRow(`
+		SELECT amount 
+		FROM transactions 
+		WHERE tx_hash = $1 AND status = 'confirmed'
+	`, txHash).Scan(&totalPaid)
+	
+	if err != nil {
+		if err == sql.ErrNoRows {
+			// fallback check RPC via listener mechanism or return error
+			return false, fmt.Errorf("transaction not found or not confirmed yet")
+		}
+		return false, err
+	}
+	
+	if totalPaid >= expectedCost {
+		return true, nil
+	}
+	
+	return false, nil
 }
