@@ -65,6 +65,7 @@ services:
       - S3_BUCKET=veritrace
       - S3_REGION=us-east-1
       - UPLOAD_BASE_URL=${UPLOAD_BASE_URL}
+      - AI_SERVICE_URL=${AI_SERVICE_URL}
 
   minio:
     image: minio/minio:latest
