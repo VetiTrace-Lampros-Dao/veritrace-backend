@@ -1104,20 +1104,30 @@ func (s *service) PinFile(ctx context.Context, reader io.Reader, filename, conte
 		return "", "", fmt.Errorf("failed to read upload file bytes: %w", err)
 	}
 
-	ipfsHash, err := s.pinFileToIPFS(ctx, bytes.NewReader(data), filename)
+	hasher := sha256.New()
+	hasher.Write(data)
+	contentHash := hex.EncodeToString(hasher.Sum(nil))
+
+	ext := ""
+	for i := len(filename) - 1; i >= 0; i-- {
+		if filename[i] == '.' {
+			ext = filename[i:]
+			break
+		}
+	}
+	uniqueFilename := contentHash + ext
+
+	ipfsHash, err := s.pinFileToIPFS(ctx, bytes.NewReader(data), uniqueFilename)
 	var ipfsUrl string
 	if err != nil {
-		hasher := sha256.New()
-		hasher.Write(data)
-		sha256Hash := fmt.Sprintf("%x", hasher.Sum(nil))
-		mockHash := "QmMock" + sha256Hash[:30]
+		mockHash := "QmMock" + contentHash[:30]
 		ipfsUrl = fmt.Sprintf("https://gateway.pinata.cloud/ipfs/%s", mockHash)
 		log.Printf("WARNING: Pinata IPFS upload failed (%v). Falling back to mock IPFS URL for testing: %s", err, ipfsUrl)
 	} else {
 		ipfsUrl = fmt.Sprintf("https://gateway.pinata.cloud/ipfs/%s", ipfsHash)
 	}
 
-	s3Url, err := s.storage.UploadFile(ctx, bytes.NewReader(data), filename, contentType)
+	s3Url, err := s.storage.UploadFile(ctx, bytes.NewReader(data), uniqueFilename, contentType)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to upload file to S3: %w", err)
 	}
