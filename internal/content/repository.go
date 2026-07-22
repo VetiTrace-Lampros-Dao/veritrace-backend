@@ -38,7 +38,11 @@ type Repository interface {
 	GetLineage(ctx context.Context, hash string) ([]*database.ContentRecord, error)
 	FlagContent(ctx context.Context, hash, reporter, reason string, timestamp int64) error
 	GetFlagCount(ctx context.Context, hash string) (int, error)
+	GetVerifiedPublisherFlagCount(ctx context.Context, hash string) (int, error)
 	GetConsensusCount(ctx context.Context, parentHash string) (int, error)
+	GetVerifiedPublisher(ctx context.Context, address string) (string, string, bool, error)
+	SaveVerifiedPublisher(ctx context.Context, address, orgName, domain string, verifiedAt int64) error
+	ListVerifiedPublishers(ctx context.Context) ([]database.VerifiedPublisher, error)
 }
 
 type repository struct {
@@ -644,6 +648,17 @@ func (r *repository) GetFlagCount(ctx context.Context, hash string) (int, error)
 	return count, err
 }
 
+func (r *repository) GetVerifiedPublisherFlagCount(ctx context.Context, hash string) (int, error) {
+	query := `
+	SELECT COUNT(*) 
+	FROM content_flags f 
+	INNER JOIN verified_publishers p ON LOWER(f.reporter_address) = LOWER(p.creator_address) 
+	WHERE f.sha256_hash = $1 AND p.status = 'active';`
+	var count int
+	err := r.db.QueryRowContext(ctx, query, hash).Scan(&count)
+	return count, err
+}
+
 func (r *repository) GetConsensusCount(ctx context.Context, parentHash string) (int, error) {
 	query := `
 	SELECT COUNT(DISTINCT creator_address) 
@@ -652,4 +667,46 @@ func (r *repository) GetConsensusCount(ctx context.Context, parentHash string) (
 	var count int
 	err := r.db.QueryRowContext(ctx, query, parentHash).Scan(&count)
 	return count, err
+}
+
+func (r *repository) GetVerifiedPublisher(ctx context.Context, address string) (string, string, bool, error) {
+	query := `SELECT organization_name, domain FROM verified_publishers WHERE LOWER(creator_address) = LOWER($1) AND status = 'active';`
+	var orgName, domain string
+	err := r.db.QueryRowContext(ctx, query, address).Scan(&orgName, &domain)
+	if err == sql.ErrNoRows {
+		return "", "", false, nil
+	}
+	if err != nil {
+		return "", "", false, err
+	}
+	return orgName, domain, true, nil
+}
+
+func (r *repository) SaveVerifiedPublisher(ctx context.Context, address, orgName, domain string, verifiedAt int64) error {
+	query := `
+	INSERT INTO verified_publishers (creator_address, organization_name, domain, verified_at, status)
+	VALUES ($1, $2, $3, $4, 'active')
+	ON CONFLICT (creator_address) DO UPDATE 
+	SET organization_name = EXCLUDED.organization_name, domain = EXCLUDED.domain, verified_at = EXCLUDED.verified_at, status = 'active';`
+	_, err := r.db.ExecContext(ctx, query, address, orgName, domain, verifiedAt)
+	return err
+}
+
+func (r *repository) ListVerifiedPublishers(ctx context.Context) ([]database.VerifiedPublisher, error) {
+	query := `SELECT creator_address, organization_name, domain, verified_at, status FROM verified_publishers WHERE status = 'active' ORDER BY organization_name ASC;`
+	rows, err := r.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []database.VerifiedPublisher
+	for rows.Next() {
+		var p database.VerifiedPublisher
+		if err := rows.Scan(&p.CreatorAddress, &p.OrganizationName, &p.Domain, &p.VerifiedAt, &p.Status); err != nil {
+			return nil, err
+		}
+		list = append(list, p)
+	}
+	return list, nil
 }

@@ -28,6 +28,14 @@ type ContentRecord struct {
 	ParentSha256    string
 }
 
+type VerifiedPublisher struct {
+	CreatorAddress   string `json:"creator_address"`
+	OrganizationName string `json:"organization_name"`
+	Domain           string `json:"domain"`
+	VerifiedAt       int64  `json:"verified_at"`
+	Status           string `json:"status"`
+}
+
 func ConnectPostgres(cfg *config.Config) (*sql.DB, error) {
 	dsn := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
 		cfg.DBHost, cfg.DBPort, cfg.DBUser, cfg.DBPassword, cfg.DBName, cfg.DBSslMode)

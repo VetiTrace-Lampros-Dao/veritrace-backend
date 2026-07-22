@@ -42,6 +42,18 @@ const contractABI = `[
 		],
 		"stateMutability": "view",
 		"type": "function"
+	},
+	{
+		"inputs": [
+			{"name": "publisher", "type": "address"}
+		],
+		"name": "isVerifiedPublisher",
+		"outputs": [
+			{"name": "orgName", "type": "string"},
+			{"name": "isVerified", "type": "bool"}
+		],
+		"stateMutability": "view",
+		"type": "function"
 	}
  ]`
 
@@ -138,4 +150,53 @@ func (v *Verifier) VerifyHash(ctx context.Context, sha256Hex string) (*OnChainRe
 		IpfsCid:    ipfsCid,
 		TxHash:     "",
 	}, nil
+}
+
+func (v *Verifier) IsVerifiedPublisher(ctx context.Context, addressHex string) (string, bool, error) {
+	if !common.IsHexAddress(addressHex) {
+		return "", false, fmt.Errorf("invalid ethereum address format")
+	}
+	addr := common.HexToAddress(addressHex)
+
+	callData, err := v.parsedABI.Pack("isVerifiedPublisher", addr)
+	if err != nil {
+		return "", false, fmt.Errorf("failed to pack call data: %w", err)
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	result, err := v.client.CallContract(callCtx, ethereum.CallMsg{
+		To:   &v.contractAddr,
+		Data: callData,
+	}, nil)
+	if err != nil {
+		// Log and fail gracefully if contract does not support this method yet (fallback to local db cache)
+		return "", false, fmt.Errorf("contract method call failed: %w", err)
+	}
+
+	if len(result) == 0 {
+		return "", false, nil
+	}
+
+	outputs, err := v.parsedABI.Unpack("isVerifiedPublisher", result)
+	if err != nil {
+		return "", false, fmt.Errorf("failed to unpack isVerifiedPublisher response: %w", err)
+	}
+
+	if len(outputs) < 2 {
+		return "", false, fmt.Errorf("unexpected output count from contract: %d", len(outputs))
+	}
+
+	orgName, ok := outputs[0].(string)
+	if !ok {
+		return "", false, fmt.Errorf("unexpected type for organization name output")
+	}
+
+	isVerified, ok := outputs[1].(bool)
+	if !ok {
+		return "", false, fmt.Errorf("unexpected type for verification status output")
+	}
+
+	return orgName, isVerified, nil
 }
