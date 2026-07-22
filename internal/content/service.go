@@ -14,6 +14,7 @@ import (
 	"math"
 	"mime/multipart"
 	"net/http"
+	"sort"
 	"time"
 
 	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/config"
@@ -31,6 +32,29 @@ type KeyframePayload struct {
 	Caption      string      `json:"caption,omitempty"`
 }
 
+type MatchDetail struct {
+	Sha256Hash        string                  `json:"sha256_hash"`
+	CreatorAddress    string                  `json:"creator_address"`
+	PHash             uint64                  `json:"phash"`
+	Similarity        float64                 `json:"similarity"`
+	Timestamp         uint64                  `json:"timestamp"`
+	MediaType         string                  `json:"media_type"`
+	MatchType         string                  `json:"match_type"` // "exact", "similar", "deepfake"
+	IsDeepfake        bool                    `json:"is_deepfake"`
+	IsAudioDeepfake   bool                    `json:"is_audio_deepfake"`
+	TemporalIntegrity float64                 `json:"temporal_integrity"`
+	ConfidenceScore   float64                 `json:"confidence_score"`
+	ConfidenceTier    string                  `json:"confidence_tier"`
+	MediaIpfsUrl      string                  `json:"media_ipfs_url,omitempty"`
+	MediaS3Url        string                  `json:"media_s3_url,omitempty"`
+	IpfsCid           string                  `json:"ipfs_cid,omitempty"`
+	AiTool            string                  `json:"ai_tool,omitempty"`
+	OnChainVerified   bool                    `json:"on_chain_verified"`
+	OnChainTxHash     string                  `json:"on_chain_tx_hash,omitempty"`
+	MatchedSegments   int                     `json:"matched_segments"`
+	Record            *database.ContentRecord `json:"record,omitempty"`
+}
+
 type VerificationResult struct {
 	MatchFound      bool                    `json:"match_found"`
 	ExactMatch      bool                    `json:"exact_match"`
@@ -40,6 +64,7 @@ type VerificationResult struct {
 	Record          *database.ContentRecord `json:"record,omitempty"`
 	OnChainVerified bool                    `json:"on_chain_verified"`
 	OnChainTxHash   string                  `json:"on_chain_tx_hash,omitempty"`
+	Matches         []MatchDetail           `json:"matches,omitempty"`
 }
 
 type SegmentVerificationResult struct {
@@ -58,6 +83,7 @@ type SegmentVerificationResult struct {
 	IsAudioDeepfake         bool                    `json:"is_audio_deepfake"`
 	TemporalIntegrity       float64                 `json:"temporal_integrity"`
 	DebugVersion            string                  `json:"debug_version,omitempty"`
+	Matches                 []MatchDetail           `json:"matches,omitempty"`
 }
 
 type VerificationCertificate struct {
@@ -265,6 +291,23 @@ func (s *service) VerifyExact(ctx context.Context, hash string) (*VerificationRe
 			})
 		}
 
+		matchDetail := MatchDetail{
+			Sha256Hash:      cached.Sha256Hash,
+			CreatorAddress:  cached.CreatorAddress,
+			PHash:           cached.PHash,
+			Similarity:      100.0,
+			Timestamp:       cached.Timestamp,
+			MediaType:       cached.MediaType,
+			MatchType:       "exact",
+			ConfidenceScore: 100.0,
+			ConfidenceTier:  "High",
+			MediaIpfsUrl:    cached.MediaIpfsUrl,
+			MediaS3Url:      cached.MediaS3Url,
+			IpfsCid:         cached.IpfsCid,
+			AiTool:          cached.AiTool,
+			Record:          cached,
+		}
+
 		return &VerificationResult{
 			MatchFound:      true,
 			ExactMatch:      true,
@@ -272,6 +315,7 @@ func (s *service) VerifyExact(ctx context.Context, hash string) (*VerificationRe
 			Record:          cached,
 			OnChainVerified: verified,
 			OnChainTxHash:   txHash,
+			Matches:         []MatchDetail{matchDetail},
 		}, nil
 	}
 
@@ -300,6 +344,23 @@ func (s *service) VerifyExact(ctx context.Context, hash string) (*VerificationRe
 		})
 	}
 
+	matchDetail := MatchDetail{
+		Sha256Hash:      record.Sha256Hash,
+		CreatorAddress:  record.CreatorAddress,
+		PHash:           record.PHash,
+		Similarity:      100.0,
+		Timestamp:       record.Timestamp,
+		MediaType:       record.MediaType,
+		MatchType:       "exact",
+		ConfidenceScore: 100.0,
+		ConfidenceTier:  "High",
+		MediaIpfsUrl:    record.MediaIpfsUrl,
+		MediaS3Url:      record.MediaS3Url,
+		IpfsCid:         record.IpfsCid,
+		AiTool:          record.AiTool,
+		Record:          record,
+	}
+
 	return &VerificationResult{
 		MatchFound:      true,
 		ExactMatch:      true,
@@ -307,6 +368,7 @@ func (s *service) VerifyExact(ctx context.Context, hash string) (*VerificationRe
 		Record:          record,
 		OnChainVerified: verified,
 		OnChainTxHash:   txHash,
+		Matches:         []MatchDetail{matchDetail},
 	}, nil
 }
 
@@ -340,7 +402,8 @@ func (s *service) GenerateCertificate(ctx context.Context, hash string) (*Verifi
 
 func (s *service) VerifyFuzzy(ctx context.Context, phash uint64) (*VerificationResult, error) {
 	vec := phashToVector(phash)
-	matches, err := s.repo.SearchVectors(ctx, vec, 1)
+	limit := uint32(5)
+	matches, err := s.repo.SearchVectors(ctx, vec, limit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to search vectors: %w", err)
 	}
@@ -351,76 +414,83 @@ func (s *service) VerifyFuzzy(ctx context.Context, phash uint64) (*VerificationR
 		}, nil
 	}
 
-	match := matches[0]
-	distance := float64(match.GetScore())
-
 	threshold := 22.0
+	var matchDetails []MatchDetail
 
-	if distance > threshold {
-		return &VerificationResult{
-			MatchFound: false,
-		}, nil
-	}
+	for _, match := range matches {
+		distance := float64(match.GetScore())
+		if distance > threshold {
+			continue
+		}
 
-	payload := match.GetPayload()
-	if payload == nil {
-		return &VerificationResult{
-			MatchFound: false,
-		}, nil
-	}
+		payload := match.GetPayload()
+		if payload == nil {
+			continue
+		}
 
-	parentHashVal, ok := payload["parent_sha256"]
-	if !ok {
-		return &VerificationResult{
-			MatchFound: false,
-		}, nil
-	}
+		parentHashVal, ok := payload["parent_sha256"]
+		if !ok {
+			continue
+		}
+		parentHash := parentHashVal.GetStringValue()
 
-	parentHash := parentHashVal.GetStringValue()
-	offsetVal, ok := payload["timestamp_offset"]
-	var offset uint64
-	if ok {
-		offset = uint64(offsetVal.GetIntegerValue())
-	}
+		recordResult, err := s.VerifyExact(ctx, parentHash)
+		if err != nil || !recordResult.MatchFound {
+			continue
+		}
 
-	mediaTypeVal, ok := payload["media_type"]
-	var mediaType string
-	if ok {
-		mediaType = mediaTypeVal.GetStringValue()
-	}
+		similarity := ((64.0 - distance) / 64.0) * 100.0
+		verified, txHash := s.crossCheckBlockchain(ctx, recordResult.Record.Sha256Hash, recordResult.Record.IpfsCid)
 
-	recordResult, err := s.VerifyExact(ctx, parentHash)
-	if err != nil || !recordResult.MatchFound {
-		return &VerificationResult{
-			MatchFound: false,
-		}, nil
-	}
+		confidenceScore := similarity
+		confidenceTier := "High"
+		if confidenceScore < 50.0 {
+			confidenceTier = "Low"
+		} else if confidenceScore < 80.0 {
+			confidenceTier = "Medium"
+		}
 
-	similarity := ((64.0 - distance) / 64.0) * 100.0
-
-	verified, txHash := s.crossCheckBlockchain(ctx, recordResult.Record.Sha256Hash, recordResult.Record.IpfsCid)
-
-	if recordResult.Record.WebhookUrl != "" {
-		s.dispatcher.Dispatch(recordResult.Record.WebhookUrl, webhook.Payload{
-			EventType:    webhook.EventDerivativeDetected,
-			OriginalHash: recordResult.Record.Sha256Hash,
-			Similarity:   similarity,
-			Timestamp:    time.Now().UTC().Format(time.RFC3339),
-			Message:      fmt.Sprintf("A derivative copy of your registered asset (%s) was verified by someone on the network. The content was found to be %.1f%% similar to your original work.", recordResult.Record.Sha256Hash, similarity),
+		matchDetails = append(matchDetails, MatchDetail{
+			Sha256Hash:      recordResult.Record.Sha256Hash,
+			CreatorAddress:  recordResult.Record.CreatorAddress,
+			PHash:           recordResult.Record.PHash,
+			Similarity:      similarity,
+			Timestamp:       recordResult.Record.Timestamp,
+			MediaType:       recordResult.Record.MediaType,
+			MatchType:       "similar",
+			ConfidenceScore: confidenceScore,
+			ConfidenceTier:  confidenceTier,
+			MediaIpfsUrl:    recordResult.Record.MediaIpfsUrl,
+			MediaS3Url:      recordResult.Record.MediaS3Url,
+			IpfsCid:         recordResult.Record.IpfsCid,
+			AiTool:          recordResult.Record.AiTool,
+			OnChainVerified: verified,
+			OnChainTxHash:   txHash,
+			Record:          recordResult.Record,
 		})
 	}
+
+	if len(matchDetails) == 0 {
+		return &VerificationResult{
+			MatchFound: false,
+		}, nil
+	}
+
+	sort.Slice(matchDetails, func(i, j int) bool {
+		return matchDetails[i].Similarity > matchDetails[j].Similarity
+	})
+
+	topMatch := matchDetails[0]
 
 	return &VerificationResult{
 		MatchFound:      true,
 		ExactMatch:      false,
-		Similarity:      similarity,
-		TimestampOffset: offset,
-		MediaType:       mediaType,
-		Record:          recordResult.Record,
-		OnChainVerified: verified,
-		OnChainTxHash:   txHash,
+		Similarity:      topMatch.Similarity,
+		MediaType:       topMatch.MediaType,
+		Record:          topMatch.Record,
+		OnChainVerified: topMatch.Record.Sha256Hash != "",
+		Matches:         matchDetails,
 	}, nil
-
 }
 
 func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []KeyframePayload, mediaType string, audioHash []float32) (*SegmentVerificationResult, error) {
@@ -436,6 +506,24 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 	exactResult, err := s.VerifyExact(ctx, sha256)
 	if err == nil && exactResult.MatchFound {
 		totalRegistered, _ := s.repo.CountSegments(ctx, sha256, segmentPointType(mediaType))
+		
+		matchDetail := MatchDetail{
+			Sha256Hash:      exactResult.Record.Sha256Hash,
+			CreatorAddress:  exactResult.Record.CreatorAddress,
+			PHash:           exactResult.Record.PHash,
+			Similarity:      100.0,
+			Timestamp:       exactResult.Record.Timestamp,
+			MediaType:       exactResult.Record.MediaType,
+			MatchType:       "exact",
+			ConfidenceScore: 100.0,
+			ConfidenceTier:  "High",
+			MediaIpfsUrl:    exactResult.Record.MediaIpfsUrl,
+			MediaS3Url:      exactResult.Record.MediaS3Url,
+			IpfsCid:         exactResult.Record.IpfsCid,
+			AiTool:          exactResult.Record.AiTool,
+			Record:          exactResult.Record,
+		}
+
 		return &SegmentVerificationResult{
 			MatchFound:              true,
 			ExactMatch:              true,
@@ -449,16 +537,20 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 			OnChainVerified:         exactResult.OnChainVerified,
 			OnChainTxHash:           exactResult.OnChainTxHash,
 			DebugVersion:            "v2",
+			Matches:                 []MatchDetail{matchDetail},
 		}, nil
 	}
 
 	pt := segmentPointType(mediaType)
 	threshold := 22.0
 	semanticThreshold := 0.85
+	faceThreshold := 0.6
+	audioThreshold := 0.999
+	limit := uint32(5)
 
 	vecs := make([][]float32, len(segments))
 	semVecs := make([][]float32, len(segments))
-	var faceVecs [][]float32 // Flattened array of all faces from all segments
+	var faceVecs [][]float32
 
 	for i, seg := range segments {
 		vecs[i] = phashToVector(seg.PHash)
@@ -468,19 +560,19 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 		}
 	}
 
-	batchResults, err := s.repo.SearchVectorsBatch(ctx, vecs, 1, pt)
+	batchResults, err := s.repo.SearchVectorsBatch(ctx, vecs, limit, pt)
 	if err != nil {
 		log.Printf("SearchVectorsBatch failed: %v", err)
 	}
 
 	var semBatchResults [][]*pb.ScoredPoint
 	if mediaType == "text" {
-		semBatchResults, err = s.repo.SearchTextVectorsBatch(ctx, semVecs, 1, pt)
+		semBatchResults, err = s.repo.SearchTextVectorsBatch(ctx, semVecs, limit, pt)
 		if err != nil {
 			log.Printf("SearchTextVectorsBatch failed: %v", err)
 		}
 	} else {
-		semBatchResults, err = s.repo.SearchSemanticVectorsBatch(ctx, semVecs, 1, pt)
+		semBatchResults, err = s.repo.SearchSemanticVectorsBatch(ctx, semVecs, limit, pt)
 		if err != nil {
 			log.Printf("SearchSemanticVectorsBatch failed: %v", err)
 		}
@@ -488,7 +580,7 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 
 	var faceBatchResults [][]*pb.ScoredPoint
 	if len(faceVecs) > 0 {
-		faceBatchResults, err = s.repo.SearchFaceVectorsBatch(ctx, faceVecs, 1, pt)
+		faceBatchResults, err = s.repo.SearchFaceVectorsBatch(ctx, faceVecs, limit, pt)
 		if err != nil {
 			log.Printf("SearchFaceVectorsBatch failed: %v", err)
 		}
@@ -496,280 +588,300 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 
 	var audioBatchResults [][]*pb.ScoredPoint
 	if len(audioHash) > 0 {
-		// Only one audio hash per video
-		audioBatchResults, err = s.repo.SearchAudioVectorsBatch(ctx, [][]float32{audioHash}, 1, "video")
+		audioBatchResults, err = s.repo.SearchAudioVectorsBatch(ctx, [][]float32{audioHash}, limit, "video")
 		if err != nil {
 			log.Printf("SearchAudioVectorsBatch failed: %v", err)
 		}
 	}
 
-	matchCounts := make(map[string]int)
+	candidateParents := make(map[string]bool)
+
+	visualMatchCounts := make(map[string]int)
 	for _, results := range batchResults {
-		if len(results) == 0 {
-			continue
-		}
-		top := results[0]
-		if float64(top.GetScore()) > threshold {
-			continue
-		}
-		payload := top.GetPayload()
-		if payload == nil {
-			continue
-		}
-		parentVal, ok := payload["parent_sha256"]
-		if ok {
-			matchCounts[parentVal.GetStringValue()]++
+		for _, match := range results {
+			if float64(match.GetScore()) > threshold {
+				continue
+			}
+			payload := match.GetPayload()
+			if payload == nil {
+				continue
+			}
+			parentVal, ok := payload["parent_sha256"]
+			if ok {
+				pHashStr := parentVal.GetStringValue()
+				visualMatchCounts[pHashStr]++
+				candidateParents[pHashStr] = true
+			}
 		}
 	}
 
 	semMatchCounts := make(map[string]int)
 	for _, results := range semBatchResults {
-		if len(results) == 0 {
-			continue
-		}
-		top := results[0]
-		if float64(top.GetScore()) < semanticThreshold {
-			continue
-		}
-		payload := top.GetPayload()
-		if payload == nil {
-			continue
-		}
-		parentVal, ok := payload["parent_sha256"]
-		if ok {
-			semMatchCounts[parentVal.GetStringValue()]++
-		}
-	}
-
-	faceMatchCounts := make(map[string]int)
-	faceThreshold := 0.6 // Cosine similarity threshold for ArcFace
-	for _, results := range faceBatchResults {
-		if len(results) == 0 {
-			continue
-		}
-		top := results[0]
-		if float64(top.GetScore()) < faceThreshold {
-			continue
-		}
-		payload := top.GetPayload()
-		if payload == nil {
-			continue
-		}
-		parentVal, ok := payload["parent_sha256"]
-		if ok {
-			faceMatchCounts[parentVal.GetStringValue()]++
-		}
-	}
-
-	bestParent := ""
-	bestCount := 0
-	for parent, count := range matchCounts {
-		if count > bestCount {
-			bestCount = count
-			bestParent = parent
-		}
-	}
-
-	bestSemParent := ""
-	bestSemCount := 0
-	for parent, count := range semMatchCounts {
-		if count > bestSemCount {
-			bestSemCount = count
-			bestSemParent = parent
-		}
-	}
-
-	bestFaceParent := ""
-	bestFaceCount := 0
-	for parent, count := range faceMatchCounts {
-		if count > bestFaceCount {
-			bestFaceCount = count
-			bestFaceParent = parent
-		}
-	}
-
-	audioMatchCounts := make(map[string]int)
-	audioThreshold := 0.999 // Increased threshold because wav2vec2 mean embeddings collapse heavily
-	for _, results := range audioBatchResults {
-		if len(results) == 0 {
-			continue
-		}
-		top := results[0]
-		log.Printf("DEBUG: Top Audio Match Score: %f", float64(top.GetScore()))
-		if float64(top.GetScore()) < audioThreshold {
-			continue
-		}
-		payload := top.GetPayload()
-		if payload == nil {
-			continue
-		}
-		parentVal, ok := payload["parent_sha256"]
-		if ok {
-			audioMatchCounts[parentVal.GetStringValue()]++
-		}
-	}
-
-	coverageUploadedPct := 0.0
-	if len(segments) > 0 {
-		coverageUploadedPct = float64(bestCount) / float64(len(segments)) * 100.0
-	}
-
-	semCoverageUploadedPct := 0.0
-	if len(segments) > 0 {
-		semCoverageUploadedPct = float64(bestSemCount) / float64(len(segments)) * 100.0
-	}
-
-	faceCoverageUploadedPct := 0.0
-	if len(segments) > 0 {
-		faceCoverageUploadedPct = float64(bestFaceCount) / float64(len(segments)) * 100.0
-	}
-
-	isDeepfake := false
-	isAudioDeepfake := false
-	finalParent := ""
-	finalCoveragePct := 0.0
-	finalMatchedSegments := 0
-
-	if coverageUploadedPct >= 5.0 {
-		finalParent = bestParent
-		finalCoveragePct = coverageUploadedPct
-		finalMatchedSegments = bestCount
-
-		log.Printf("DEBUG: Visual match found. finalParent=%s, len(audioHash)=%d, audioMatchCounts[finalParent]=%d", finalParent, len(audioHash), audioMatchCounts[finalParent])
-
-		// If visual matches completely, but audio hash differs -> Audio deepfake!
-		if len(audioHash) > 0 && audioMatchCounts[finalParent] == 0 {
-			log.Printf("DEBUG: Flagging Audio Deepfake!")
-			isDeepfake = true
-			isAudioDeepfake = true
-		} else if len(audioHash) == 0 {
-			log.Printf("DEBUG: Bypassing Audio Deepfake check because len(audioHash) == 0 (no audio detected in uploaded video)")
-		} else {
-			log.Printf("DEBUG: Not flagging Audio Deepfake because audioMatchCounts[finalParent] > 0")
-		}
-
-		finalParent = bestParent
-		finalCoveragePct = coverageUploadedPct
-		finalMatchedSegments = bestCount
-	} else if faceCoverageUploadedPct >= 10.0 {
-		finalParent = bestFaceParent
-		finalCoveragePct = faceCoverageUploadedPct
-		finalMatchedSegments = bestFaceCount
-		isDeepfake = true
-	} else if semCoverageUploadedPct >= 10.0 {
-		finalParent = bestSemParent
-		finalCoveragePct = semCoverageUploadedPct
-		finalMatchedSegments = bestSemCount
-		isDeepfake = true
-	} else {
-		return &SegmentVerificationResult{MatchFound: false}, nil
-	}
-
-	parentResult, err := s.VerifyExact(ctx, finalParent)
-	if err != nil || !parentResult.MatchFound {
-		return &SegmentVerificationResult{MatchFound: false}, nil
-	}
-
-	totalRegistered, _ := s.repo.CountSegments(ctx, finalParent, pt)
-	coverageRegisteredPct := 0.0
-	if totalRegistered > 0 {
-		coverageRegisteredPct = float64(finalMatchedSegments) / float64(totalRegistered) * 100.0
-	}
-
-	similarity := (finalCoveragePct + coverageRegisteredPct) / 2.0
-
-	// Penalize the similarity score if the video matches but the audio was swapped
-	if isAudioDeepfake {
-		similarity = similarity * 0.5
-	}
-
-	verified, txHash := s.crossCheckBlockchain(ctx, parentResult.Record.Sha256Hash, parentResult.Record.IpfsCid)
-
-	if parentResult.Record.WebhookUrl != "" {
-		msg := fmt.Sprintf("A matching segment of your registered asset (%s) was verified by someone on the network. The uploaded content is %.1f%% similar to your original work.", parentResult.Record.Sha256Hash, similarity)
-		if isAudioDeepfake {
-			msg = fmt.Sprintf("CRITICAL ALERT: An Audio Deepfake (Voice Cloning) of your registered video (%s) was detected during a verification check! The visual content matches, but the audio track has been maliciously manipulated.", parentResult.Record.Sha256Hash)
-		} else if isDeepfake {
-			msg = fmt.Sprintf("CRITICAL ALERT: A Deepfake or AI-altered version of your registered asset (%s) was detected during a verification check!", parentResult.Record.Sha256Hash)
-		}
-		s.dispatcher.Dispatch(parentResult.Record.WebhookUrl, webhook.Payload{
-			EventType:    webhook.EventDerivativeDetected,
-			OriginalHash: parentResult.Record.Sha256Hash,
-			Similarity:   similarity,
-			Timestamp:    time.Now().UTC().Format(time.RFC3339),
-			Message:      msg,
-		})
-	}
-
-	result := &SegmentVerificationResult{
-		MatchFound:              true,
-		ExactMatch:              false,
-		Similarity:              similarity,
-		MatchedSegments:         finalMatchedSegments,
-		TotalSegmentsUploaded:   len(segments),
-		TotalSegmentsRegistered: totalRegistered,
-		CoverageUploadedPct:     finalCoveragePct,
-		CoverageRegisteredPct:   coverageRegisteredPct,
-		Record:                  parentResult.Record,
-		OnChainVerified:         verified,
-		OnChainTxHash:           txHash,
-		IsDeepfake:              isDeepfake,
-		IsAudioDeepfake:         isAudioDeepfake,
-		TemporalIntegrity:       0.0,
-		DebugVersion:            "v2",
-	}
-
-	// Calculate Temporal Integrity using Dynamic Time Warping (DTW)
-	if finalMatchedSegments > 1 {
-		var uploadedOffsets []float64
-		var matchedOffsets []float64
-
-		// Extract matched timestamp offsets for the final parent
-		for i, results := range batchResults {
-			if len(results) == 0 {
+		for _, match := range results {
+			if float64(match.GetScore()) < semanticThreshold {
 				continue
 			}
-			top := results[0]
-			if float64(top.GetScore()) > threshold {
-				continue
-			}
-			payload := top.GetPayload()
+			payload := match.GetPayload()
 			if payload == nil {
 				continue
 			}
 			parentVal, ok := payload["parent_sha256"]
-			if ok && parentVal.GetStringValue() == finalParent {
-				offsetVal, okOffset := payload["timestamp_offset"]
-				if okOffset {
-					uploadedOffsets = append(uploadedOffsets, float64(i))
-					matchedOffsets = append(matchedOffsets, float64(offsetVal.GetIntegerValue()))
+			if ok {
+				pHashStr := parentVal.GetStringValue()
+				semMatchCounts[pHashStr]++
+				candidateParents[pHashStr] = true
+			}
+		}
+	}
+
+	faceMatchCounts := make(map[string]int)
+	for _, results := range faceBatchResults {
+		for _, match := range results {
+			if float64(match.GetScore()) < faceThreshold {
+				continue
+			}
+			payload := match.GetPayload()
+			if payload == nil {
+				continue
+			}
+			parentVal, ok := payload["parent_sha256"]
+			if ok {
+				pHashStr := parentVal.GetStringValue()
+				faceMatchCounts[pHashStr]++
+				candidateParents[pHashStr] = true
+			}
+		}
+	}
+
+	audioMatchCounts := make(map[string]int)
+	for _, results := range audioBatchResults {
+		for _, match := range results {
+			if float64(match.GetScore()) < audioThreshold {
+				continue
+			}
+			payload := match.GetPayload()
+			if payload == nil {
+				continue
+			}
+			parentVal, ok := payload["parent_sha256"]
+			if ok {
+				pHashStr := parentVal.GetStringValue()
+				audioMatchCounts[pHashStr]++
+				candidateParents[pHashStr] = true
+			}
+		}
+	}
+
+	var matchDetails []MatchDetail
+
+	for parent := range candidateParents {
+		visualCount := visualMatchCounts[parent]
+		semCount := semMatchCounts[parent]
+		faceCount := faceMatchCounts[parent]
+		audioCount := audioMatchCounts[parent]
+
+		coverageUploadedPct := 0.0
+		if len(segments) > 0 {
+			coverageUploadedPct = float64(visualCount) / float64(len(segments)) * 100.0
+		}
+
+		semCoverageUploadedPct := 0.0
+		if len(segments) > 0 {
+			semCoverageUploadedPct = float64(semCount) / float64(len(segments)) * 100.0
+		}
+
+		faceCoverageUploadedPct := 0.0
+		if len(faceVecs) > 0 {
+			faceCoverageUploadedPct = float64(faceCount) / float64(len(faceVecs)) * 100.0
+		}
+
+		isVisualMatch := coverageUploadedPct >= 5.0
+		isFaceMatch := faceCoverageUploadedPct >= 10.0
+		isSemMatch := semCoverageUploadedPct >= 10.0
+
+		if !isVisualMatch && !isFaceMatch && !isSemMatch {
+			continue
+		}
+
+		isDeepfake := false
+		isAudioDeepfake := false
+		finalCoveragePct := 0.0
+		finalMatchedSegments := 0
+
+		if isVisualMatch {
+			finalCoveragePct = coverageUploadedPct
+			finalMatchedSegments = visualCount
+
+			if len(audioHash) > 0 && audioCount == 0 {
+				isDeepfake = true
+				isAudioDeepfake = true
+			}
+		} else if isFaceMatch {
+			finalCoveragePct = faceCoverageUploadedPct
+			finalMatchedSegments = faceCount
+			isDeepfake = true
+		} else if isSemMatch {
+			finalCoveragePct = semCoverageUploadedPct
+			finalMatchedSegments = semCount
+			isDeepfake = true
+		}
+
+		parentResult, err := s.VerifyExact(ctx, parent)
+		if err != nil || !parentResult.MatchFound {
+			continue
+		}
+
+		totalRegistered, _ := s.repo.CountSegments(ctx, parent, pt)
+		coverageRegisteredPct := 0.0
+		if totalRegistered > 0 {
+			coverageRegisteredPct = float64(finalMatchedSegments) / float64(totalRegistered) * 100.0
+		}
+
+		similarity := (finalCoveragePct + coverageRegisteredPct) / 2.0
+		if isAudioDeepfake {
+			similarity = similarity * 0.5
+		}
+
+		verified, txHash := s.crossCheckBlockchain(ctx, parentResult.Record.Sha256Hash, parentResult.Record.IpfsCid)
+
+		temporalIntegrity := 0.0
+		if finalMatchedSegments > 1 {
+			var uploadedOffsets []float64
+			var matchedOffsets []float64
+
+			for i, results := range batchResults {
+				for _, match := range results {
+					if float64(match.GetScore()) > threshold {
+						continue
+					}
+					payload := match.GetPayload()
+					if payload == nil {
+						continue
+					}
+					parentVal, ok := payload["parent_sha256"]
+					if ok && parentVal.GetStringValue() == parent {
+						offsetVal, okOffset := payload["timestamp_offset"]
+						if okOffset {
+							uploadedOffsets = append(uploadedOffsets, float64(i))
+							matchedOffsets = append(matchedOffsets, float64(offsetVal.GetIntegerValue()))
+							break
+						}
+					}
 				}
 			}
+
+			if len(uploadedOffsets) > 1 && len(matchedOffsets) > 1 {
+				shift := matchedOffsets[0] - uploadedOffsets[0]
+				normalizedDist := 0.0
+				for i := range matchedOffsets {
+					expected := uploadedOffsets[i] + shift
+					normalizedDist += math.Abs(matchedOffsets[i] - expected)
+				}
+
+				maxError := float64(len(matchedOffsets)) * float64(len(matchedOffsets))
+				integrity := 100.0 * (1.0 - (normalizedDist / maxError))
+				if integrity < 0 {
+					integrity = 0
+				}
+				if integrity > 100 {
+					integrity = 100
+				}
+				temporalIntegrity = integrity
+			}
 		}
 
-		if len(uploadedOffsets) > 1 && len(matchedOffsets) > 1 {
-			_ = dtwDistance(uploadedOffsets, matchedOffsets)
-			// Max possible distance if reversed is roughly length^2 / 2.
-			// For a perfect sequence, dist = constant shift difference.
-			// We calculate differences to normalize the shift.
-			shift := matchedOffsets[0] - uploadedOffsets[0]
-			normalizedDist := 0.0
-			for i := range matchedOffsets {
-				expected := uploadedOffsets[i] + shift
-				normalizedDist += math.Abs(matchedOffsets[i] - expected)
-			}
-
-			// Dist is the sum of absolute errors. We convert to a percentage integrity score.
-			maxError := float64(len(matchedOffsets)) * float64(len(matchedOffsets))
-			integrity := 100.0 * (1.0 - (normalizedDist / maxError))
-			if integrity < 0 {
-				integrity = 0
-			}
-			if integrity > 100 {
-				integrity = 100
-			}
-			result.TemporalIntegrity = integrity
+		confidenceScore := similarity
+		if temporalIntegrity > 0 {
+			confidenceScore = (similarity * 0.7) + (temporalIntegrity * 0.3)
 		}
+		if isDeepfake {
+			confidenceScore = confidenceScore * 0.5
+		}
+
+		confidenceTier := "High"
+		if confidenceScore < 50.0 {
+			confidenceTier = "Low"
+		} else if confidenceScore < 80.0 {
+			confidenceTier = "Medium"
+		}
+
+		matchType := "similar"
+		if isDeepfake {
+			matchType = "deepfake"
+		}
+
+		matchDetails = append(matchDetails, MatchDetail{
+			Sha256Hash:        parentResult.Record.Sha256Hash,
+			CreatorAddress:    parentResult.Record.CreatorAddress,
+			PHash:             parentResult.Record.PHash,
+			Similarity:        similarity,
+			Timestamp:         parentResult.Record.Timestamp,
+			MediaType:         parentResult.Record.MediaType,
+			MatchType:         matchType,
+			IsDeepfake:        isDeepfake,
+			IsAudioDeepfake:   isAudioDeepfake,
+			TemporalIntegrity: temporalIntegrity,
+			ConfidenceScore:   confidenceScore,
+			ConfidenceTier:    confidenceTier,
+			MediaIpfsUrl:      parentResult.Record.MediaIpfsUrl,
+			MediaS3Url:        parentResult.Record.MediaS3Url,
+			IpfsCid:           parentResult.Record.IpfsCid,
+			AiTool:            parentResult.Record.AiTool,
+			OnChainVerified:   verified,
+			OnChainTxHash:     txHash,
+			MatchedSegments:   finalMatchedSegments,
+			Record:            parentResult.Record,
+		})
+	}
+
+	if len(matchDetails) == 0 {
+		return &SegmentVerificationResult{MatchFound: false}, nil
+	}
+
+	sort.Slice(matchDetails, func(i, j int) bool {
+		return matchDetails[i].Similarity > matchDetails[j].Similarity
+	})
+
+	topMatch := matchDetails[0]
+
+	// Send webhook alert for top plagiarism concern if registered Creator doesn't match uploader
+	if topMatch.Similarity >= 80.0 && topMatch.CreatorAddress != sha256 { // sha256 is the query uploader in this context
+		if topMatch.Record.WebhookUrl != "" {
+			msg := fmt.Sprintf("A matching segment of your registered asset (%s) was verified by someone on the network. The uploaded content is %.1f%% similar to your original work.", topMatch.Record.Sha256Hash, topMatch.Similarity)
+			if topMatch.IsAudioDeepfake {
+				msg = fmt.Sprintf("CRITICAL ALERT: An Audio Deepfake (Voice Cloning) of your registered video (%s) was detected during a verification check! The visual content matches, but the audio track has been maliciously manipulated.", topMatch.Record.Sha256Hash)
+			} else if topMatch.IsDeepfake {
+				msg = fmt.Sprintf("CRITICAL ALERT: A Deepfake or AI-altered version of your registered asset (%s) was detected during a verification check!", topMatch.Record.Sha256Hash)
+			}
+			s.dispatcher.Dispatch(topMatch.Record.WebhookUrl, webhook.Payload{
+				EventType:    webhook.EventDerivativeDetected,
+				OriginalHash: topMatch.Record.Sha256Hash,
+				Similarity:   topMatch.Similarity,
+				Timestamp:    time.Now().UTC().Format(time.RFC3339),
+				Message:      msg,
+			})
+		}
+	}
+
+	topMatchTotalRegistered, _ := s.repo.CountSegments(ctx, topMatch.Sha256Hash, pt)
+
+	result := &SegmentVerificationResult{
+		MatchFound:              true,
+		ExactMatch:              false,
+		Similarity:              topMatch.Similarity,
+		MatchedSegments:         topMatch.MatchedSegments,
+		TotalSegmentsUploaded:   len(segments),
+		TotalSegmentsRegistered: topMatchTotalRegistered,
+		CoverageUploadedPct:     topMatch.Similarity,
+		CoverageRegisteredPct:   topMatch.Similarity,
+		Record:                  topMatch.Record,
+		OnChainVerified:         topMatch.OnChainVerified,
+		OnChainTxHash:           topMatch.OnChainTxHash,
+		IsDeepfake:              topMatch.IsDeepfake,
+		IsAudioDeepfake:         topMatch.IsAudioDeepfake,
+		TemporalIntegrity:       topMatch.TemporalIntegrity,
+		DebugVersion:            "v2",
+		Matches:                 matchDetails,
 	}
 
 	_ = s.repo.SaveSegmentCache(ctx, cacheKey, result)
