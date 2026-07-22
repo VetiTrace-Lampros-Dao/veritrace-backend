@@ -52,6 +52,7 @@ type MatchDetail struct {
 	OnChainVerified   bool                    `json:"on_chain_verified"`
 	OnChainTxHash     string                  `json:"on_chain_tx_hash,omitempty"`
 	MatchedSegments   int                     `json:"matched_segments"`
+	FlagCount         int                     `json:"flag_count"`
 	Record            *database.ContentRecord `json:"record,omitempty"`
 }
 
@@ -108,6 +109,7 @@ type Service interface {
 	GetCheckpoint(ctx context.Context, key string) (uint64, error)
 	SaveCheckpoint(ctx context.Context, key string, val uint64) error
 	GetLineage(ctx context.Context, hash string) ([]*database.ContentRecord, error)
+	FlagContent(ctx context.Context, hash, reporter, reason string, timestamp int64) error
 }
 
 type service struct {
@@ -291,6 +293,8 @@ func (s *service) VerifyExact(ctx context.Context, hash string) (*VerificationRe
 			})
 		}
 
+		flags, _ := s.repo.GetFlagCount(ctx, cached.Sha256Hash)
+
 		matchDetail := MatchDetail{
 			Sha256Hash:      cached.Sha256Hash,
 			CreatorAddress:  cached.CreatorAddress,
@@ -305,6 +309,7 @@ func (s *service) VerifyExact(ctx context.Context, hash string) (*VerificationRe
 			MediaS3Url:      cached.MediaS3Url,
 			IpfsCid:         cached.IpfsCid,
 			AiTool:          cached.AiTool,
+			FlagCount:       flags,
 			Record:          cached,
 		}
 
@@ -344,6 +349,8 @@ func (s *service) VerifyExact(ctx context.Context, hash string) (*VerificationRe
 		})
 	}
 
+	flags, _ := s.repo.GetFlagCount(ctx, record.Sha256Hash)
+
 	matchDetail := MatchDetail{
 		Sha256Hash:      record.Sha256Hash,
 		CreatorAddress:  record.CreatorAddress,
@@ -358,6 +365,7 @@ func (s *service) VerifyExact(ctx context.Context, hash string) (*VerificationRe
 		MediaS3Url:      record.MediaS3Url,
 		IpfsCid:         record.IpfsCid,
 		AiTool:          record.AiTool,
+		FlagCount:       flags,
 		Record:          record,
 	}
 
@@ -450,6 +458,8 @@ func (s *service) VerifyFuzzy(ctx context.Context, phash uint64) (*VerificationR
 			confidenceTier = "Medium"
 		}
 
+		flags, _ := s.repo.GetFlagCount(ctx, recordResult.Record.Sha256Hash)
+
 		matchDetails = append(matchDetails, MatchDetail{
 			Sha256Hash:      recordResult.Record.Sha256Hash,
 			CreatorAddress:  recordResult.Record.CreatorAddress,
@@ -466,6 +476,7 @@ func (s *service) VerifyFuzzy(ctx context.Context, phash uint64) (*VerificationR
 			AiTool:          recordResult.Record.AiTool,
 			OnChainVerified: verified,
 			OnChainTxHash:   txHash,
+			FlagCount:       flags,
 			Record:          recordResult.Record,
 		})
 	}
@@ -507,6 +518,8 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 	if err == nil && exactResult.MatchFound {
 		totalRegistered, _ := s.repo.CountSegments(ctx, sha256, segmentPointType(mediaType))
 		
+		flags, _ := s.repo.GetFlagCount(ctx, exactResult.Record.Sha256Hash)
+		
 		matchDetail := MatchDetail{
 			Sha256Hash:      exactResult.Record.Sha256Hash,
 			CreatorAddress:  exactResult.Record.CreatorAddress,
@@ -521,6 +534,7 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 			MediaS3Url:      exactResult.Record.MediaS3Url,
 			IpfsCid:         exactResult.Record.IpfsCid,
 			AiTool:          exactResult.Record.AiTool,
+			FlagCount:       flags,
 			Record:          exactResult.Record,
 		}
 
@@ -810,6 +824,8 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 			matchType = "deepfake"
 		}
 
+		flags, _ := s.repo.GetFlagCount(ctx, parentResult.Record.Sha256Hash)
+
 		matchDetails = append(matchDetails, MatchDetail{
 			Sha256Hash:        parentResult.Record.Sha256Hash,
 			CreatorAddress:    parentResult.Record.CreatorAddress,
@@ -830,6 +846,7 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 			OnChainVerified:   verified,
 			OnChainTxHash:     txHash,
 			MatchedSegments:   finalMatchedSegments,
+			FlagCount:         flags,
 			Record:            parentResult.Record,
 		})
 	}
@@ -1206,4 +1223,8 @@ func (s *service) pinFileToIPFS(ctx context.Context, reader io.Reader, filename 
 
 func (s *service) GetLineage(ctx context.Context, hash string) ([]*database.ContentRecord, error) {
 	return s.repo.GetLineage(ctx, hash)
+}
+
+func (s *service) FlagContent(ctx context.Context, hash, reporter, reason string, timestamp int64) error {
+	return s.repo.FlagContent(ctx, hash, reporter, reason, timestamp)
 }
