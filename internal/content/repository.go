@@ -38,6 +38,7 @@ type Repository interface {
 	GetLineage(ctx context.Context, hash string) ([]*database.ContentRecord, error)
 	FlagContent(ctx context.Context, hash, reporter, reason string, timestamp int64) error
 	GetFlagCount(ctx context.Context, hash string) (int, error)
+	GetConsensusCount(ctx context.Context, parentHash string) (int, error)
 }
 
 type repository struct {
@@ -640,5 +641,15 @@ func (r *repository) GetFlagCount(ctx context.Context, hash string) (int, error)
 	query := `SELECT COUNT(*) FROM content_flags WHERE sha256_hash = $1;`
 	var count int
 	err := r.db.QueryRowContext(ctx, query, hash).Scan(&count)
+	return count, err
+}
+
+func (r *repository) GetConsensusCount(ctx context.Context, parentHash string) (int, error) {
+	query := `
+	SELECT COUNT(DISTINCT creator_address) 
+	FROM content_records 
+	WHERE parent_sha256 = $1 OR sha256_hash = $1;`
+	var count int
+	err := r.db.QueryRowContext(ctx, query, parentHash).Scan(&count)
 	return count, err
 }

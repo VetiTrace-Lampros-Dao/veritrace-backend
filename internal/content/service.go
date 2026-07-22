@@ -53,6 +53,7 @@ type MatchDetail struct {
 	OnChainTxHash     string                  `json:"on_chain_tx_hash,omitempty"`
 	MatchedSegments   int                     `json:"matched_segments"`
 	FlagCount         int                     `json:"flag_count"`
+	ConsensusCount    int                     `json:"consensus_count"`
 	Record            *database.ContentRecord `json:"record,omitempty"`
 }
 
@@ -169,8 +170,9 @@ func (s *service) Register(ctx context.Context, record database.ContentRecord, k
 		matchedWebhook = fuzzyCheck.Record.WebhookUrl
 	}
 
-	if matchFound && matchSimilarity >= 80.0 && matchedCreator != record.CreatorAddress {
-		if matchedWebhook != "" {
+	if matchFound && matchSimilarity >= 80.0 {
+		record.ParentSha256 = matchedHash
+		if matchedCreator != record.CreatorAddress && matchedWebhook != "" {
 			s.dispatcher.Dispatch(matchedWebhook, webhook.Payload{
 				EventType:    webhook.EventPlagiarismAlert,
 				OriginalHash: matchedHash,
@@ -294,6 +296,7 @@ func (s *service) VerifyExact(ctx context.Context, hash string) (*VerificationRe
 		}
 
 		flags, _ := s.repo.GetFlagCount(ctx, cached.Sha256Hash)
+		consensusCount, _ := s.repo.GetConsensusCount(ctx, cached.Sha256Hash)
 
 		matchDetail := MatchDetail{
 			Sha256Hash:      cached.Sha256Hash,
@@ -310,6 +313,7 @@ func (s *service) VerifyExact(ctx context.Context, hash string) (*VerificationRe
 			IpfsCid:         cached.IpfsCid,
 			AiTool:          cached.AiTool,
 			FlagCount:       flags,
+			ConsensusCount:  consensusCount,
 			Record:          cached,
 		}
 
@@ -350,6 +354,7 @@ func (s *service) VerifyExact(ctx context.Context, hash string) (*VerificationRe
 	}
 
 	flags, _ := s.repo.GetFlagCount(ctx, record.Sha256Hash)
+	consensusCount, _ := s.repo.GetConsensusCount(ctx, record.Sha256Hash)
 
 	matchDetail := MatchDetail{
 		Sha256Hash:      record.Sha256Hash,
@@ -366,6 +371,7 @@ func (s *service) VerifyExact(ctx context.Context, hash string) (*VerificationRe
 		IpfsCid:         record.IpfsCid,
 		AiTool:          record.AiTool,
 		FlagCount:       flags,
+		ConsensusCount:  consensusCount,
 		Record:          record,
 	}
 
@@ -451,6 +457,18 @@ func (s *service) VerifyFuzzy(ctx context.Context, phash uint64) (*VerificationR
 		verified, txHash := s.crossCheckBlockchain(ctx, recordResult.Record.Sha256Hash, recordResult.Record.IpfsCid)
 
 		confidenceScore := similarity
+		consensusCount, _ := s.repo.GetConsensusCount(ctx, recordResult.Record.Sha256Hash)
+		if consensusCount > 1 {
+			boost := float64(consensusCount-1) * 5.0
+			if boost > 15.0 {
+				boost = 15.0
+			}
+			confidenceScore += boost
+			if confidenceScore > 100.0 {
+				confidenceScore = 100.0
+			}
+		}
+
 		confidenceTier := "High"
 		if confidenceScore < 50.0 {
 			confidenceTier = "Low"
@@ -477,6 +495,7 @@ func (s *service) VerifyFuzzy(ctx context.Context, phash uint64) (*VerificationR
 			OnChainVerified: verified,
 			OnChainTxHash:   txHash,
 			FlagCount:       flags,
+			ConsensusCount:  consensusCount,
 			Record:          recordResult.Record,
 		})
 	}
@@ -519,6 +538,7 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 		totalRegistered, _ := s.repo.CountSegments(ctx, sha256, segmentPointType(mediaType))
 		
 		flags, _ := s.repo.GetFlagCount(ctx, exactResult.Record.Sha256Hash)
+		consensusCount, _ := s.repo.GetConsensusCount(ctx, exactResult.Record.Sha256Hash)
 		
 		matchDetail := MatchDetail{
 			Sha256Hash:      exactResult.Record.Sha256Hash,
@@ -535,6 +555,7 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 			IpfsCid:         exactResult.Record.IpfsCid,
 			AiTool:          exactResult.Record.AiTool,
 			FlagCount:       flags,
+			ConsensusCount:  consensusCount,
 			Record:          exactResult.Record,
 		}
 
@@ -812,6 +833,18 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 			confidenceScore = confidenceScore * 0.5
 		}
 
+		consensusCount, _ := s.repo.GetConsensusCount(ctx, parentResult.Record.Sha256Hash)
+		if consensusCount > 1 {
+			boost := float64(consensusCount-1) * 5.0
+			if boost > 15.0 {
+				boost = 15.0
+			}
+			confidenceScore += boost
+			if confidenceScore > 100.0 {
+				confidenceScore = 100.0
+			}
+		}
+
 		confidenceTier := "High"
 		if confidenceScore < 50.0 {
 			confidenceTier = "Low"
@@ -847,6 +880,7 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 			OnChainTxHash:     txHash,
 			MatchedSegments:   finalMatchedSegments,
 			FlagCount:         flags,
+			ConsensusCount:  consensusCount,
 			Record:            parentResult.Record,
 		})
 	}
