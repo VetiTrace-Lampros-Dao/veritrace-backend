@@ -36,6 +36,9 @@ type Repository interface {
 	GetCheckpoint(ctx context.Context, key string) (uint64, error)
 	SaveCheckpoint(ctx context.Context, key string, val uint64) error
 	GetLineage(ctx context.Context, hash string) ([]*database.ContentRecord, error)
+	FlagContent(ctx context.Context, hash, reporter, reason string, timestamp int64) error
+	GetFlagCount(ctx context.Context, hash string) (int, error)
+	GetConsensusCount(ctx context.Context, parentHash string) (int, error)
 }
 
 type repository struct {
@@ -621,4 +624,32 @@ func (r *repository) GetSegmentCache(ctx context.Context, key string) (*SegmentV
 		return nil, err
 	}
 	return &result, nil
+}
+
+func (r *repository) FlagContent(ctx context.Context, hash, reporter, reason string, timestamp int64) error {
+	query := `
+	INSERT INTO content_flags (sha256_hash, reporter_address, reason, timestamp)
+	VALUES ($1, $2, $3, $4)
+	ON CONFLICT (sha256_hash, reporter_address) DO UPDATE 
+	SET reason = EXCLUDED.reason, timestamp = EXCLUDED.timestamp;`
+
+	_, err := r.db.ExecContext(ctx, query, hash, reporter, reason, timestamp)
+	return err
+}
+
+func (r *repository) GetFlagCount(ctx context.Context, hash string) (int, error) {
+	query := `SELECT COUNT(*) FROM content_flags WHERE sha256_hash = $1;`
+	var count int
+	err := r.db.QueryRowContext(ctx, query, hash).Scan(&count)
+	return count, err
+}
+
+func (r *repository) GetConsensusCount(ctx context.Context, parentHash string) (int, error) {
+	query := `
+	SELECT COUNT(DISTINCT creator_address) 
+	FROM content_records 
+	WHERE parent_sha256 = $1 OR sha256_hash = $1;`
+	var count int
+	err := r.db.QueryRowContext(ctx, query, parentHash).Scan(&count)
+	return count, err
 }

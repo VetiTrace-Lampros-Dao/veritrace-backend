@@ -3,6 +3,7 @@ package content
 import (
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -156,4 +157,26 @@ func (h *Handler) GetLineage(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"lineage": chain, "depth": len(chain)})
+}
+
+func (h *Handler) FlagContent(c *gin.Context) {
+	var req struct {
+		SHA256   string `json:"sha256" binding:"required"`
+		Reporter string `json:"reporter" binding:"required"`
+		Reason   string `json:"reason" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body: " + err.Error()})
+		return
+	}
+
+	timestamp := time.Now().Unix()
+	err := h.service.FlagContent(c.Request.Context(), req.SHA256, req.Reporter, req.Reason, timestamp)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to record flag: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "content flagged successfully"})
 }
