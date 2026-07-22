@@ -94,16 +94,29 @@ func (r *repository) GetPostgres(ctx context.Context, hash string) (*database.Co
 
 func (r *repository) GetLineage(ctx context.Context, hash string) ([]*database.ContentRecord, error) {
 	query := `
-	WITH RECURSIVE lineage AS (
-		SELECT sha256_hash, creator_address, phash, timestamp, ipfs_cid, ai_tool, media_ipfs_url, media_s3_url, allow_ai_training, media_type, webhook_url, COALESCE(parent_sha256, '') as parent_sha256
+	WITH RECURSIVE upstream AS (
+		SELECT sha256_hash, parent_sha256
 		FROM content_records WHERE sha256_hash = $1
+		UNION ALL
+		SELECT cr.sha256_hash, cr.parent_sha256
+		FROM content_records cr
+		INNER JOIN upstream u ON cr.sha256_hash = u.parent_sha256
+	),
+	root AS (
+		SELECT sha256_hash 
+		FROM upstream 
+		WHERE parent_sha256 = '' OR parent_sha256 IS NULL 
+		LIMIT 1
+	),
+	downstream AS (
+		SELECT sha256_hash, creator_address, phash, timestamp, ipfs_cid, ai_tool, media_ipfs_url, media_s3_url, allow_ai_training, media_type, webhook_url, COALESCE(parent_sha256, '') as parent_sha256
+		FROM content_records WHERE sha256_hash = (SELECT sha256_hash FROM root)
 		UNION ALL
 		SELECT cr.sha256_hash, cr.creator_address, cr.phash, cr.timestamp, cr.ipfs_cid, cr.ai_tool, cr.media_ipfs_url, cr.media_s3_url, cr.allow_ai_training, cr.media_type, cr.webhook_url, COALESCE(cr.parent_sha256, '') as parent_sha256
 		FROM content_records cr
-		INNER JOIN lineage l ON cr.sha256_hash = l.parent_sha256
-		WHERE cr.sha256_hash != ''
+		INNER JOIN downstream d ON cr.parent_sha256 = d.sha256_hash
 	)
-	SELECT * FROM lineage;`
+	SELECT * FROM downstream;`
 
 	rows, err := r.db.QueryContext(ctx, query, hash)
 	if err != nil {
