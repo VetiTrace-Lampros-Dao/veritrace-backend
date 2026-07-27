@@ -318,23 +318,25 @@ func (h *EnterpriseHandler) UnlockDataset(c *gin.Context) {
 	}
 
 	query := fmt.Sprintf(`
-		SELECT sha256_hash, s3_url
+		SELECT sha256_hash, media_s3_url
 		FROM content_records
 		WHERE sha256_hash IN (%s)
 	`, placeholders)
 
 	rows, err := h.db.QueryContext(c.Request.Context(), query, args...)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to query database for URLs"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to query database for URLs: " + err.Error()})
 		return
 	}
 	defer rows.Close()
 
 	urls := make(map[string]string)
+	var links []string
 	for rows.Next() {
 		var hash, url string
 		if err := rows.Scan(&hash, &url); err == nil {
 			urls[hash] = url
+			links = append(links, url)
 		}
 	}
 
@@ -352,6 +354,7 @@ func (h *EnterpriseHandler) UnlockDataset(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Payment verified successfully. High-res datasets unlocked.",
 		"urls":    urls,
+		"links":   links,
 	})
 }
 
