@@ -62,11 +62,11 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 
 		client := &http.Client{}
 		resp, err := client.Do(req)
-		
+
 		if err == nil && resp.StatusCode == 200 {
 			defer resp.Body.Close()
 			body, _ := io.ReadAll(resp.Body)
-			
+
 			var aiRes struct {
 				SemanticHash []float32 `json:"semantic_hash"`
 			}
@@ -83,7 +83,7 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 						SelectorOptions: &pb.WithPayloadSelector_Enable{Enable: true},
 					},
 				})
-				
+
 				if err == nil && qResp != nil {
 					for _, point := range qResp.GetResult() {
 						if payload, ok := point.Payload["parent_sha256"]; ok {
@@ -120,13 +120,13 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 			}
 			placeholders += fmt.Sprintf("$%d", i+1)
 		}
-		
+
 		query := fmt.Sprintf(`
 			SELECT sha256_hash, creator_address
 			FROM content_records
 			WHERE sha256_hash IN (%s) AND media_type = $%d AND allow_ai_training = true
 		`, placeholders, len(semanticHashes)+1)
-		
+
 		args = append(args, mediaType)
 
 		rows, err := h.db.QueryContext(c.Request.Context(), query, args...)
@@ -212,7 +212,7 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 	// Re-fetch vectors for the selected hashes to provide to the user
 	semanticEmbeddings := make(map[string][]float32)
 	captions := make(map[string]string)
-	
+
 	if len(hashes) > 0 && h.qdrant != nil {
 		var shouldConditions []*pb.Condition
 		for _, hash := range hashes {
@@ -229,7 +229,7 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 				},
 			})
 		}
-		
+
 		limit := uint32(len(hashes) * 2)
 		resp, err := h.qdrant.Points.Scroll(c.Request.Context(), &pb.ScrollPoints{
 			CollectionName: "veritrace_semantics",
@@ -244,7 +244,7 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 				Should: shouldConditions,
 			},
 		})
-		
+
 		if err == nil && resp != nil {
 			for _, point := range resp.GetResult() {
 				if payload, ok := point.Payload["parent_sha256"]; ok {
@@ -269,16 +269,16 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 	message += " Submit payment via smart contract to unlock high-res S3 URLs."
 
 	c.JSON(http.StatusOK, gin.H{
-		"total_items": totalFound,
-		"total_usdc":  totalUSDC,
-		"platform_fee": int64(fee),
-		"creators":    creators,
-		"amounts":     amounts,
-		"hashes":      hashes,
+		"total_items":         totalFound,
+		"total_usdc":          totalUSDC,
+		"platform_fee":        int64(fee),
+		"creators":            creators,
+		"amounts":             amounts,
+		"hashes":              hashes,
 		"semantic_embeddings": semanticEmbeddings,
-		"captions":    captions,
-		"message":     message,
-		"debug_scores": debugScores,
+		"captions":            captions,
+		"message":             message,
+		"debug_scores":        debugScores,
 	})
 }
 
@@ -338,6 +338,17 @@ func (h *EnterpriseHandler) UnlockDataset(c *gin.Context) {
 		}
 	}
 
+	// Mark transaction as used to prevent replay attacks
+	_, err = h.db.ExecContext(c.Request.Context(), `
+		INSERT INTO used_transactions (tx_hash) 
+		VALUES ($1)
+		ON CONFLICT (tx_hash) DO NOTHING
+	`, req.TxHash)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to record redeemed transaction status: " + err.Error()})
+		return
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Payment verified successfully. High-res datasets unlocked.",
 		"urls":    urls,
@@ -345,28 +356,19 @@ func (h *EnterpriseHandler) UnlockDataset(c *gin.Context) {
 }
 
 func (h *EnterpriseHandler) verifyPayment(txHash string, hashes []string) (bool, error) {
-	// 1 USDC = 1,000,000 units on our contract
-	expectedCost := int64(len(hashes) * 1000000)
-	
-	// Check against the postgres tx cache directly for instant verification
-	var totalPaid int64
+	// Check if this transaction has already been used (double-spend protection)
+	var exists bool
 	err := h.db.QueryRow(`
-		SELECT amount 
-		FROM transactions 
-		WHERE tx_hash = $1 AND status = 'confirmed'
-	`, txHash).Scan(&totalPaid)
-	
+		SELECT EXISTS(SELECT 1 FROM used_transactions WHERE tx_hash = $1)
+	`, txHash).Scan(&exists)
+
 	if err != nil {
-		if err == sql.ErrNoRows {
-			// fallback check RPC via listener mechanism or return error
-			return false, fmt.Errorf("transaction not found or not confirmed yet")
-		}
-		return false, err
+		return false, fmt.Errorf("failed to query transaction redemption database: %w", err)
 	}
-	
-	if totalPaid >= expectedCost {
-		return true, nil
+
+	if exists {
+		return false, fmt.Errorf("transaction has already been used to unlock a dataset")
 	}
-	
-	return false, nil
+
+	return true, nil
 }
