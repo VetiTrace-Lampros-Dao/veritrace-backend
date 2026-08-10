@@ -332,38 +332,38 @@ When a query request is submitted to `/verify/segments` for a video, document, o
 
 ```mermaid
 graph TD
-    Start[Verify Request] --> ExactCheck{1. Exact Match Check}
-    ExactCheck -->|Cache/DB Hit| Ret100[Return 100% Match]
-    ExactCheck -->|Miss| SegCheck[2. Segmented Vector Lookup]
-    SegCheck --> SearchQdrant[Query Qdrant Vector Batches]
-    SearchQdrant --> CheckThresholds{3. Apply Metric Thresholds}
+    Start["Verify Request"] --> ExactCheck{"1. Exact Match Check"}
+    ExactCheck -->|Cache/DB Hit| Ret100["Return 100% Match"]
+    ExactCheck -->|Miss| SegCheck["2. Segmented Vector Lookup"]
+    SegCheck --> SearchQdrant["Query Qdrant Vector Batches"]
+    SearchQdrant --> CheckThresholds{"3. Apply Metric Thresholds"}
     
-    CheckThresholds --> pHashMatch[pHash Distance <= 22.0]
-    CheckThresholds --> SemanticMatch[CLIP/MiniLM Cosine >= 0.85]
-    CheckThresholds --> FaceMatch[InsightFace Cosine >= 0.60]
-    CheckThresholds --> AudioMatch[Wav2Vec2 Cosine >= 0.999]
+    CheckThresholds --> pHashMatch["pHash Distance <= 22.0"]
+    CheckThresholds --> SemanticMatch["CLIP/MiniLM Cosine >= 0.85"]
+    CheckThresholds --> FaceMatch["InsightFace Cosine >= 0.60"]
+    CheckThresholds --> AudioMatch["Wav2Vec2 Cosine >= 0.999"]
     
-    pHashMatch & SemanticMatch & FaceMatch & AudioMatch --> CalcCoverage[4. Compute Coverage Percentages]
-    CalcCoverage --> DeepfakeFilter{5. Deepfake Detection Checks}
+    pHashMatch & SemanticMatch & FaceMatch & AudioMatch --> CalcCoverage["4. Compute Coverage Percentages"]
+    CalcCoverage --> DeepfakeFilter{"5. Deepfake Detection Checks"}
     
-    DeepfakeFilter -->|Visual match & NO Audio match| SetAudioFake[Mark Audio Deepfake / Halve Similarity]
-    DeepfakeFilter -->|Face/Semantic match only| SetVisualFake[Mark Face/Visual Deepfake]
+    DeepfakeFilter -->|Visual match & NO Audio match| SetAudioFake["Mark Audio Deepfake / Halve Similarity"]
+    DeepfakeFilter -->|Face/Semantic match only| SetVisualFake["Mark Face/Visual Deepfake"]
     
-    DeepfakeFilter --> OrderCheck{6. Sequence Alignment Check}
-    OrderCheck -->|Multiple segments match| ComputeTemporal[Calculate Temporal Integrity %]
-    OrderCheck -->|Single segment match| SkipTemporal[Temporal Integrity = 0%]
+    DeepfakeFilter --> OrderCheck{"6. Sequence Alignment Check"}
+    OrderCheck -->|Multiple segments match| ComputeTemporal["Calculate Temporal Integrity %"]
+    OrderCheck -->|Single segment match| SkipTemporal["Temporal Integrity = 0%"]
     
-    ComputeTemporal & SkipTemporal --> FinalScore[7. Calculate Confidence & Plagiarism Alerts]
-    FinalScore --> End[Return SegmentVerificationResult]
+    ComputeTemporal & SkipTemporal --> FinalScore["7. Calculate Confidence & Plagiarism Alerts"]
+    FinalScore --> End["Return SegmentVerificationResult"]
 ```
 
 1. **Exact Match Check**: The system computes the file's SHA-256 hash. If there is a cache (Redis) or database (PostgreSQL) hit, the verification resolves immediately returning `similarity: 100%`.
 2. **Segmented Vector Search**: If no exact match is found, the backend maps the uploaded segments' perceptual hashes (pHash), semantic embeddings, face vectors, and audio speech footprints. It performs batch queries against the Qdrant Vector database to locate matching segment points.
-3. **Similarity Metric Thresholds**:
-   - **pHash (Visual distance representation)**: Manhattan distance threshold of `<= 22.0` (scores higher than 22 are discarded).
-   - **Semantic Embedding (CLIP/MiniLM)**: Cosine similarity threshold of `>= 0.85`.
-   - **Face Embedding (InsightFace)**: Cosine similarity threshold of `>= 0.60`.
-   - **Audio Embedding (Wav2Vec2)**: Cosine similarity threshold of `>= 0.999`.
+3. **Similarity Metric Thresholds & Percentage Equivalence**:
+   - **pHash (Visual distance representation)**: Manhattan distance threshold of `<= 22.0`. In percentage terms, this maps to `((64.0 - distance) / 64.0) * 100.0`, translating to **`>= 65.625%`** visual similarity.
+   - **Semantic Embedding (CLIP/MiniLM)**: Cosine similarity threshold of `>= 0.85`, translating directly to **`>= 85.0%`** semantic text/visual similarity.
+   - **Face Embedding (InsightFace)**: Cosine similarity threshold of `>= 0.60`, translating directly to **`>= 60.0%`** face similarity.
+   - **Audio Embedding (Wav2Vec2)**: Cosine similarity threshold of `>= 0.999`, translating directly to **`>= 99.9%`** vocal acoustic pattern similarity.
 4. **Candidate Coverage Requirements**:
    - A candidate parent asset must meet coverage thresholds to prevent accidental matches:
      - **Visual Coverage** (matched segments / uploaded segments) `* 100 >= 5.0%`
