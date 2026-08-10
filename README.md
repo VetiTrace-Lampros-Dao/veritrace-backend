@@ -1,27 +1,64 @@
 # VeriTrace Core Backend Engine
 
-This repository contains the core orchestration, database metadata management, and high-speed fuzzy search engine for **VeriTrace** (Blockchain-Backed Content Provenance). 
+[![Language](https://img.shields.io/badge/Language-Go-blue.svg?style=flat-square&logo=go)](https://go.dev/)
+[![Framework](https://img.shields.io/badge/Framework-Gin%20Gonic-cyan.svg?style=flat-square)](https://gin-gonic.com/)
+[![Database](https://img.shields.io/badge/Database-PostgreSQL-blue.svg?style=flat-square&logo=postgresql)](https://www.postgresql.org/)
+[![Cache](https://img.shields.io/badge/Cache-Redis-red.svg?style=flat-square&logo=redis)](https://redis.io/)
+[![VectorDB](https://img.shields.io/badge/VectorDB-Qdrant-darkblue.svg?style=flat-square)](https://qdrant.tech/)
 
-The backend acts as the router connecting our on-chain registry (deployed on Arbitrum Sepolia), off-chain storage metadata, and the local database caching/vector indices.
+The **VeriTrace Core Backend Engine** is the orchestration hub, database manager, and fuzzy/exact search engine for the **VeriTrace** content provenance ecosystem. It connects the Layer-2 on-chain Arbitrum Sepolia smart contract registry, decentralized metadata storage (IPFS), local caching systems, and high-performance vector databases for near-instantaneous content verification.
 
 ---
 
-## Technical Stack & Ports
-* **Language**: Go (v1.26.1)
-* **Framework**: Gin Gonic (HTTP REST API)
-* **Database**: PostgreSQL v15 (Relational Store)
-* **Cache**: Redis v7 (Exact-match cache)
-* **Vector DB**: Qdrant (gRPC connection for Hamming-distance KNN search)
-* **Web3 Integration**: Go-Ethereum (WebSocket event logs parser)
+## Codebase Context
+Below is the link reference to the core files in this repository:
+- **Server Entrypoint**: [main.go](cmd/server/main.go)
+- **Routing Engine**: [router.go](internal/api/router.go)
+- **Database Configurations**: [postgres.go](internal/database/postgres.go) | [redis.go](internal/database/redis.go)
+- **Vector DB Client**: [qdrant.go](internal/vector/qdrant.go)
+- **Blockchain Event Listener**: [evm_listener.go](internal/listener/evm_listener.go) | [pipeline.go](internal/listener/pipeline.go)
+- **Core Provenance Business Logic**: [service.go](internal/content/service.go) | [repository.go](internal/content/repository.go) | [handler.go](internal/content/handler.go)
+- **Configuration Parsing**: [config.go](config/config.go)
+
+---
+
+## Problem Statement
+
+Integrating decentralized ledgers (like blockchain) into high-performance web applications is inherently slow and complex:
+1. **Latency**: Direct on-chain calls (EVM lookups) take seconds to resolve, which is unacceptable for real-time applications or browser extensions checking hundreds of images on a page.
+2. **Complex Querying**: Blockchains do not support fuzzy text searches, visual perceptual searches, or vector similarity lookups. They only support exact-key matches.
+3. **Data Retrieval Overhead**: Content metadata (like author info, creation tools, and verification timestamps) stored on IPFS requires multi-second fetch periods over HTTP gateways, leading to poor user experience.
+
+---
+
+## Solution Overview
+
+The Core Backend acts as a high-speed off-chain synchronization and caching layer that bridges Web3 immutability with Web2 responsiveness:
+- **EVM Event Syncing**: A background event listener runs constantly, filtering events emitted by the Arbitrum Sepolia contract. When it detects `ContentRegistered`, it automatically downloads the corresponding JSON metadata from IPFS, parses it, and writes it to a high-speed local database.
+- **Hierarchical Caching**: Incoming exact-match verification requests hit a **Redis cache** first. If missed, they fall back to a relational **Postgres database** and update the cache, achieving sub-10ms response times.
+- **Perceptual Vector Matching**: Perceptual hashes are split into multi-dimensional float arrays and indexed in **Qdrant Vector DB**. The backend performs KNN (K-Nearest Neighbor) lookups using Manhattan/L1 distance calculations to locate visually modified versions of original assets in milliseconds.
+- **Segment-Based Video Alignment**: For documents and videos, the backend processes arrays of keyframe signatures, executing custom algorithms to locate matching sections and calculate overall edit similarity.
+
+---
+
+## Technology Stack
+
+- **Primary Language**: Go (v1.26.1)
+- **Web Framework**: **Gin Gonic (HTTP REST API)**
+- **Relational Storage**: **PostgreSQL v15** (via `pgx` driver pool)
+- **Caching Store**: **Redis v7** (key-value cache layer)
+- **Vector Search Engine**: **Qdrant** (gRPC connection)
+- **Web3 Blockchain Gateway**: **Go-Ethereum (geth)** RPC Client
+- **Storage Integrations**: Pinata IPFS SDK & AWS S3/MinIO SDK
 
 ---
 
 ## Directory Architecture
 
-We use a layered modular architecture pattern (**Repository -> Service -> Handler -> App Router**) to keep database details decoupled from routing endpoints:
+The repository utilizes a clean, layered architectural pattern (**Repository -> Service -> Handler -> App Router**) to keep database transactions separated from routing endpoints:
 
 ```text
-.
+veritrace-core-backend/
 ├── cmd/
 │   └── server/
 │       └── main.go           # Orchestrates server startup and dependency injection
@@ -53,15 +90,14 @@ We use a layered modular architecture pattern (**Repository -> Service -> Handle
 
 ---
 
-## System Flows
+## System Flows & Sequence Diagrams
 
-### 1. The Registration Flow
-
+### 1. Asset Registration Flow (EVM Syncing)
 ```mermaid
 sequenceDiagram
     autonumber
     actor Creator
-    participant Python as Python Microservice
+    participant Hashing as Hashing Service
     participant IPFS as IPFS Gateway
     participant Contract as Arbitrum Registry
     participant Go as Go Backend Event Listener
@@ -69,11 +105,11 @@ sequenceDiagram
     participant Redis as Redis Cache
     participant Qdrant as Qdrant Vector DB
 
-    Creator->>Python: Upload original media file
-    Python->>Python: Compute SHA-256 and keyframe pHashes
-    Python->>IPFS: Upload pHash metadata JSON
-    IPFS-->>Python: Return ipfsCid
-    Python-->>Creator: Return SHA-256, average pHash, ipfsCid
+    Creator->>Hashing: Upload original media file
+    Hashing->>Hashing: Compute SHA-256 and keyframe pHashes
+    Hashing->>IPFS: Upload metadata JSON
+    IPFS-->>Hashing: Return ipfsCid
+    Hashing-->>Creator: Return SHA-256, average pHash, ipfsCid
     Creator->>Contract: Sign & send transaction: registerContent()
     Contract-->>Go: Emit ContentRegistered(sha256, creator, phash, ipfsCid, aitool)
     Go->>IPFS: Fetch keyframe metadata JSON via ipfsCid
@@ -83,10 +119,7 @@ sequenceDiagram
     Go->>Qdrant: Index keyframe pHashes (64-dim float vectors)
 ```
 
----
-
-### 2. The Verification Flow
-
+### 2. Asset Verification Flow
 ```mermaid
 sequenceDiagram
     autonumber
@@ -124,15 +157,18 @@ sequenceDiagram
 
 ---
 
-## Getting Started
+## Environment Variable Requirements
 
-### 1. Configure Environment Variables
-Create a `.env` file in the root directory (copy from `.env.example`):
+Set the following variables in a `.env` file inside the project directory (based on `.env.example`):
 
 ```env
-CONTRACT_ADDRESS=0xd5a4e9185cbcea881f2c76b07732335250537820
+# The deployed Arbitrum Sepolia contract address
+CONTRACT_ADDRESS=0xeb09ca3b844693817479cf33fd88cdf02c2711fd
+
+# Backend listener and router port
 PORT=8080
 
+# PostgreSQL credentials
 DB_HOST=localhost
 DB_PORT=5432
 DB_USER=postgres
@@ -140,38 +176,69 @@ DB_PASSWORD=postgres
 DB_NAME=veritrace
 DB_SSLMODE=disable
 
+# Redis credentials
 REDIS_HOST=localhost
 REDIS_PORT=6379
 REDIS_PASSWORD=
 REDIS_DB=0
 
+# Qdrant Vector DB gRPC Endpoint
 QDRANT_HOST=localhost
 QDRANT_PORT=6334
 
+# EVM Node Gateway Websocket URL (e.g. Alchemy, Infura, or Quicknode)
 ARBITRUM_SEPOLIA_WS_URL=wss://arb-sepolia.g.alchemy.com/v2/YOUR_ALCHEMY_KEY
+
+# Pinata JWT for IPFS Pinning Operations
+PINATA_JWT=your_pinata_jwt_token
+
+# S3 Backup/Archival credentials (MinIO for local development)
+S3_ENDPOINT=http://localhost:9000
+S3_PUBLIC_ENDPOINT=http://localhost:9000
+S3_ACCESS_KEY=minioadmin
+S3_SECRET_KEY=minioadmin
+S3_BUCKET=veritrace
+S3_REGION=us-east-1
+UPLOAD_BASE_URL=http://localhost:8080/uploads
 ```
 
 ---
 
-### 2. Boot Local Services (Docker)
-Start the entire local infrastructure: Postgres, Redis, Qdrant, and the Go application:
+## Setup & Local Run Instructions
 
+### 1. Run via Docker Compose (Recommended)
+This will set up PostgreSQL, Redis, Qdrant, and start the Go server inside a docker network automatically:
 ```bash
 docker compose up -d --build
 ```
+On boot, the Go server automatically:
+1. Waits for PostgreSQL to be ready.
+2. Runs schema auto-migrations.
+3. Automatically creates Qdrant index collections.
+4. Spawns the websocket listener connecting to Arbitrum Sepolia.
 
-The Go application automatically waits for the PostgreSQL database container to pass its `pg_isready` healthcheck, executes all database migrations, creates the Qdrant collections/indexes, and starts listening for blockchain events.
+### 2. Manual Development Run
+If you have local instances of Postgres, Redis, and Qdrant running:
+```bash
+# Install Go dependencies
+go mod download
+
+# Start the server
+go run cmd/server/main.go
+```
 
 ---
 
-### 3. Verify Server Status
-Once the containers are running, query the health check endpoint:
+## How to Test and Verify
 
+Once the server is booted, verify the service endpoints using `curl`:
+
+### 1. Health Probe
+Check connections to PostgreSQL and Redis:
 ```bash
-curl https://api.veritrace.dpkvtrading.online/health
+curl http://localhost:8080/health
 ```
-
-Expected Response:
+**Expected Response**:
 ```json
 {
   "status": "UP",
@@ -180,148 +247,47 @@ Expected Response:
 }
 ```
 
----
-
-## API Documentation
-
-### 1. Exact Verification
-* **Endpoint**: `GET /api/v1/verify/exact`
-* **Query Parameters**:
-  * `hash`: The SHA-256 hash of the media file (e.g., `0x6ca0...`).
-* **Example Query**:
-  ```bash
-  curl "https://api.veritrace.dpkvtrading.online/api/v1/verify/exact?hash=0x6ca0f85e3618e276dffd6d4ea07f14e35570c3b1d041e1378b074aa0054e5d18"
-  ```
-* **Example Response**:
-  ```json
-  {
-    "match_found": true,
-    "exact_match": true,
-    "similarity": 100,
-    "record": {
-      "Sha256Hash": "0x6ca0f85e3618e276dffd6d4ea07f14e35570c3b1d041e1378b074aa0054e5d18",
-      "CreatorAddress": "0xd94059F8276bb9F3aF2fA86f7D2B237c519F1919",
-      "PHash": 9876543210123,
-      "Timestamp": 1783445355,
-      "IpfsCid": "QmYwAPJzv5CZ1aA5xrxPAjXX1cYk87t7XN7Cpd1Egw2a5B",
-      "AiTool": "DALL-E 3"
-    }
+### 2. Verify Exact Match (SHA-256)
+Search the registry database and cache for an exact matching SHA-256 hash:
+```bash
+curl "http://localhost:8080/api/v1/verify/exact?hash=0x6ca0f85e3618e276dffd6d4ea07f14e35570c3b1d041e1378b074aa0054e5d18"
+```
+**Example Response**:
+```json
+{
+  "match_found": true,
+  "exact_match": true,
+  "similarity": 100,
+  "record": {
+    "Sha256Hash": "0x6ca0f85e3618e276dffd6d4ea07f14e35570c3b1d041e1378b074aa0054e5d18",
+    "CreatorAddress": "0xd94059F8276bb9F3aF2fA86f7D2B237c519F1919",
+    "PHash": 9876543210123,
+    "Timestamp": 1783445355,
+    "IpfsCid": "QmYwAPJzv5CZ1aA5xrxPAjXX1cYk87t7XN7Cpd1Egw2a5B",
+    "AiTool": "DALL-E 3"
   }
-  ```
+}
+```
 
----
-
-### 2. Fuzzy Verification (Fuzzy Search)
-* **Endpoint**: `GET /api/v1/verify/fuzzy`
-* **Query Parameters**:
-  * `phash`: The 64-bit integer visual perceptual hash of the file.
-* **Example Query**:
-  ```bash
-  curl "https://api.veritrace.dpkvtrading.online/api/v1/verify/fuzzy?phash=9876543210123"
-  ```
-* **Example Response**:
-  ```json
-  {
-    "match_found": true,
-    "exact_match": false,
-    "similarity": 98.4375,
-    "timestamp_offset": 145,
-    "record": {
-      "Sha256Hash": "0x6ca0f85e3618e276dffd6d4ea07f14e35570c3b1d041e1378b074aa0054e5d18",
-      "CreatorAddress": "0xd94059F8276bb9F3aF2fA86f7D2B237c519F1919",
-      "PHash": 9876543210123,
-      "Timestamp": 1783445355,
-      "IpfsCid": "QmYwAPJzv5CZ1aA5xrxPAjXX1cYk87t7XN7Cpd1Egw2a5B",
-      "AiTool": "DALL-E 3"
-    }
+### 3. Verify Fuzzy Match (pHash similarity)
+Perform a K-NN vector lookup in Qdrant based on a visual perceptual hash:
+```bash
+curl "http://localhost:8080/api/v1/verify/fuzzy?phash=9876543210123"
+```
+**Example Response**:
+```json
+{
+  "match_found": true,
+  "exact_match": false,
+  "similarity": 98.4375,
+  "timestamp_offset": 0,
+  "record": {
+    "Sha256Hash": "0x6ca0f85e3618e276dffd6d4ea07f14e35570c3b1d041e1378b074aa0054e5d18",
+    "CreatorAddress": "0xd94059F8276bb9F3aF2fA86f7D2B237c519F1919",
+    "PHash": 9876543210123,
+    "Timestamp": 1783445355,
+    "IpfsCid": "QmYwAPJzv5CZ1aA5xrxPAjXX1cYk87t7XN7Cpd1Egw2a5B",
+    "AiTool": "DALL-E 3"
   }
-  ```
-
----
-
-### 3. Segmented Match Verification (Videos & Documents)
-* **Endpoint**: `POST /api/v1/verify/segments`
-* **Content-Type**: `application/json`
-* **Request Body**:
-  ```json
-  {
-    "sha256": "0x123...",
-    "media_type": "video",
-    "segments": [
-      { "offset": 1, "phash": 567890123 }
-    ]
-  }
-  ```
-* **Example Response**:
-  ```json
-  {
-    "match_found": true,
-    "exact_match": false,
-    "similarity": 88.5,
-    "matched_segments": 42,
-    "record": { ... }
-  }
-  ```
-
----
-
-### 4. IPFS Pinning Endpoints
-* **`POST /api/v1/pin-file`**: Uploads and pins a raw media file (using `multipart/form-data` with `file`). Returns `{"ipfs_cid": "Qm..."}`.
-* **`POST /api/v1/pin`**: Uploads and pins a JSON metadata payload (using `application/json`). Returns `{"ipfs_cid": "Qm..."}`.
-
----
-
-### 5. Utilities
-* **`GET /api/v1/verify/certificate?hash=0x...`**: Exports a verifiable JSON certificate of registration.
-* **`GET /api/v1/content/:hash/lineage`**: Retrieves the tree of all known derivative versions stemming from an original parent asset.
-
----
-
-## Hashing Service API (Port: 8081)
-
-### Extract Signatures
-* **Endpoint**: `POST /api/v1/hash`
-* **Content-Type**: `multipart/form-data`
-* **Request**: Upload the media file in the `file` field.
-* **Response (Images)**:
-  ```json
-  {
-    "sha256": "0x123...",
-    "phash": 1234567890,
-    "media_type": "image"
-  }
-  ```
-* **Response (Videos/Documents)**:
-  ```json
-  {
-    "sha256": "0x123...",
-    "phash": 0,
-    "media_type": "video",
-    "keyframes": [
-      { "offset": 1, "phash": 567890123 }
-    ]
-  }
-  ```
-
----
-
-## Frontend Integration Flow
-
-> **Production Base URLs:**
-> * **Hashing Service:** `https://api.hash.veritrace.dpkvtrading.online`
-> * **Core API Backend:** `https://api.veritrace.dpkvtrading.online`
-
-### A. Asset Registration Flow
-1. **Extract Signatures**: `POST https://api.hash.veritrace.dpkvtrading.online/api/v1/hash` to get `sha256`, `phash`, and `keyframes`.
-2. **Pin Media to IPFS**: `POST https://api.veritrace.dpkvtrading.online/api/v1/pin-file` to get the media's `ipfs_cid`.
-3. **Pin Metadata**: Construct metadata JSON and `POST https://api.veritrace.dpkvtrading.online/api/v1/pin`.
-4. **On-Chain Transaction**: Prompt wallet to execute `registerContent` on the smart contract.
-5. **Wait for Confirmation**: Frontend waits for transaction receipt.
-
-### B. Asset Verification Flow
-1. **Extract Signatures**: `POST https://api.hash.veritrace.dpkvtrading.online/api/v1/hash` with the query file.
-2. **Check Exact Match**: `GET https://api.veritrace.dpkvtrading.online/api/v1/verify/exact?hash={sha256}`.
-3. **Fallback to Fuzzy/Segmented Match**:
-   * **Single images**: `GET https://api.veritrace.dpkvtrading.online/api/v1/verify/fuzzy?phash={phash}`.
-   * **Videos/Documents**: `POST https://api.veritrace.dpkvtrading.online/api/v1/verify/segments` with extracted keyframes.
-4. **Display Results**: Receive response and display **Exact Match**, **Derivative Match** (with similarity %), or **Unregistered Asset**.
+}
+```

@@ -38,7 +38,11 @@ type Repository interface {
 	GetLineage(ctx context.Context, hash string) ([]*database.ContentRecord, error)
 	FlagContent(ctx context.Context, hash, reporter, reason string, timestamp int64) error
 	GetFlagCount(ctx context.Context, hash string) (int, error)
+	GetVerifiedPublisherFlagCount(ctx context.Context, hash string) (int, error)
 	GetConsensusCount(ctx context.Context, parentHash string) (int, error)
+	GetVerifiedPublisher(ctx context.Context, address string) (string, string, bool, error)
+	SaveVerifiedPublisher(ctx context.Context, address, orgName, domain string, verifiedAt int64) error
+	ListVerifiedPublishers(ctx context.Context) ([]database.VerifiedPublisher, error)
 }
 
 type repository struct {
@@ -90,16 +94,29 @@ func (r *repository) GetPostgres(ctx context.Context, hash string) (*database.Co
 
 func (r *repository) GetLineage(ctx context.Context, hash string) ([]*database.ContentRecord, error) {
 	query := `
-	WITH RECURSIVE lineage AS (
-		SELECT sha256_hash, creator_address, phash, timestamp, ipfs_cid, ai_tool, media_ipfs_url, media_s3_url, allow_ai_training, media_type, webhook_url, COALESCE(parent_sha256, '') as parent_sha256
+	WITH RECURSIVE upstream AS (
+		SELECT sha256_hash, parent_sha256
 		FROM content_records WHERE sha256_hash = $1
+		UNION ALL
+		SELECT cr.sha256_hash, cr.parent_sha256
+		FROM content_records cr
+		INNER JOIN upstream u ON cr.sha256_hash = u.parent_sha256
+	),
+	root AS (
+		SELECT sha256_hash 
+		FROM upstream 
+		WHERE parent_sha256 = '' OR parent_sha256 IS NULL 
+		LIMIT 1
+	),
+	downstream AS (
+		SELECT sha256_hash, creator_address, phash, timestamp, ipfs_cid, ai_tool, media_ipfs_url, media_s3_url, allow_ai_training, media_type, webhook_url, COALESCE(parent_sha256, '') as parent_sha256
+		FROM content_records WHERE sha256_hash = (SELECT sha256_hash FROM root)
 		UNION ALL
 		SELECT cr.sha256_hash, cr.creator_address, cr.phash, cr.timestamp, cr.ipfs_cid, cr.ai_tool, cr.media_ipfs_url, cr.media_s3_url, cr.allow_ai_training, cr.media_type, cr.webhook_url, COALESCE(cr.parent_sha256, '') as parent_sha256
 		FROM content_records cr
-		INNER JOIN lineage l ON cr.sha256_hash = l.parent_sha256
-		WHERE cr.sha256_hash != ''
+		INNER JOIN downstream d ON cr.parent_sha256 = d.sha256_hash
 	)
-	SELECT * FROM lineage;`
+	SELECT * FROM downstream;`
 
 	rows, err := r.db.QueryContext(ctx, query, hash)
 	if err != nil {
@@ -644,6 +661,17 @@ func (r *repository) GetFlagCount(ctx context.Context, hash string) (int, error)
 	return count, err
 }
 
+func (r *repository) GetVerifiedPublisherFlagCount(ctx context.Context, hash string) (int, error) {
+	query := `
+	SELECT COUNT(*) 
+	FROM content_flags f 
+	INNER JOIN verified_publishers p ON LOWER(f.reporter_address) = LOWER(p.creator_address) 
+	WHERE f.sha256_hash = $1 AND p.status = 'active';`
+	var count int
+	err := r.db.QueryRowContext(ctx, query, hash).Scan(&count)
+	return count, err
+}
+
 func (r *repository) GetConsensusCount(ctx context.Context, parentHash string) (int, error) {
 	query := `
 	SELECT COUNT(DISTINCT creator_address) 
@@ -652,4 +680,46 @@ func (r *repository) GetConsensusCount(ctx context.Context, parentHash string) (
 	var count int
 	err := r.db.QueryRowContext(ctx, query, parentHash).Scan(&count)
 	return count, err
+}
+
+func (r *repository) GetVerifiedPublisher(ctx context.Context, address string) (string, string, bool, error) {
+	query := `SELECT organization_name, domain FROM verified_publishers WHERE LOWER(creator_address) = LOWER($1) AND status = 'active';`
+	var orgName, domain string
+	err := r.db.QueryRowContext(ctx, query, address).Scan(&orgName, &domain)
+	if err == sql.ErrNoRows {
+		return "", "", false, nil
+	}
+	if err != nil {
+		return "", "", false, err
+	}
+	return orgName, domain, true, nil
+}
+
+func (r *repository) SaveVerifiedPublisher(ctx context.Context, address, orgName, domain string, verifiedAt int64) error {
+	query := `
+	INSERT INTO verified_publishers (creator_address, organization_name, domain, verified_at, status)
+	VALUES ($1, $2, $3, $4, 'active')
+	ON CONFLICT (creator_address) DO UPDATE 
+	SET organization_name = EXCLUDED.organization_name, domain = EXCLUDED.domain, verified_at = EXCLUDED.verified_at, status = 'active';`
+	_, err := r.db.ExecContext(ctx, query, address, orgName, domain, verifiedAt)
+	return err
+}
+
+func (r *repository) ListVerifiedPublishers(ctx context.Context) ([]database.VerifiedPublisher, error) {
+	query := `SELECT creator_address, organization_name, domain, verified_at, status FROM verified_publishers WHERE status = 'active' ORDER BY organization_name ASC;`
+	rows, err := r.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []database.VerifiedPublisher
+	for rows.Next() {
+		var p database.VerifiedPublisher
+		if err := rows.Scan(&p.CreatorAddress, &p.OrganizationName, &p.Domain, &p.VerifiedAt, &p.Status); err != nil {
+			return nil, err
+		}
+		list = append(list, p)
+	}
+	return list, nil
 }

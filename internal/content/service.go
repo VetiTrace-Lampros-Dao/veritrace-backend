@@ -15,6 +15,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/VetiTrace-Lampros-Dao/veritrace-backend/config"
@@ -33,28 +34,31 @@ type KeyframePayload struct {
 }
 
 type MatchDetail struct {
-	Sha256Hash        string                  `json:"sha256_hash"`
-	CreatorAddress    string                  `json:"creator_address"`
-	PHash             uint64                  `json:"phash"`
-	Similarity        float64                 `json:"similarity"`
-	Timestamp         uint64                  `json:"timestamp"`
-	MediaType         string                  `json:"media_type"`
-	MatchType         string                  `json:"match_type"` // "exact", "similar", "deepfake"
-	IsDeepfake        bool                    `json:"is_deepfake"`
-	IsAudioDeepfake   bool                    `json:"is_audio_deepfake"`
-	TemporalIntegrity float64                 `json:"temporal_integrity"`
-	ConfidenceScore   float64                 `json:"confidence_score"`
-	ConfidenceTier    string                  `json:"confidence_tier"`
-	MediaIpfsUrl      string                  `json:"media_ipfs_url,omitempty"`
-	MediaS3Url        string                  `json:"media_s3_url,omitempty"`
-	IpfsCid           string                  `json:"ipfs_cid,omitempty"`
-	AiTool            string                  `json:"ai_tool,omitempty"`
-	OnChainVerified   bool                    `json:"on_chain_verified"`
-	OnChainTxHash     string                  `json:"on_chain_tx_hash,omitempty"`
-	MatchedSegments   int                     `json:"matched_segments"`
-	FlagCount         int                     `json:"flag_count"`
-	ConsensusCount    int                     `json:"consensus_count"`
-	Record            *database.ContentRecord `json:"record,omitempty"`
+	Sha256Hash           string                  `json:"sha256_hash"`
+	CreatorAddress       string                  `json:"creator_address"`
+	PHash                uint64                  `json:"phash"`
+	Similarity           float64                 `json:"similarity"`
+	Timestamp            uint64                  `json:"timestamp"`
+	MediaType            string                  `json:"media_type"`
+	MatchType            string                  `json:"match_type"` // "exact", "similar", "deepfake"
+	IsDeepfake           bool                    `json:"is_deepfake"`
+	IsAudioDeepfake      bool                    `json:"is_audio_deepfake"`
+	TemporalIntegrity    float64                 `json:"temporal_integrity"`
+	ConfidenceScore      float64                 `json:"confidence_score"`
+	ConfidenceTier       string                  `json:"confidence_tier"`
+	MediaIpfsUrl         string                  `json:"media_ipfs_url,omitempty"`
+	MediaS3Url           string                  `json:"media_s3_url,omitempty"`
+	IpfsCid              string                  `json:"ipfs_cid,omitempty"`
+	AiTool               string                  `json:"ai_tool,omitempty"`
+	OnChainVerified      bool                    `json:"on_chain_verified"`
+	OnChainTxHash        string                  `json:"on_chain_tx_hash,omitempty"`
+	MatchedSegments      int                     `json:"matched_segments"`
+	FlagCount            int                     `json:"flag_count"`
+	PublisherFlagCount   int                     `json:"publisher_flag_count"`
+	ConsensusCount       int                     `json:"consensus_count"`
+	IsPublisherVerified  bool                    `json:"is_publisher_verified"`
+	PublisherName        string                  `json:"publisher_name,omitempty"`
+	Record               *database.ContentRecord `json:"record,omitempty"`
 }
 
 type VerificationResult struct {
@@ -111,6 +115,8 @@ type Service interface {
 	SaveCheckpoint(ctx context.Context, key string, val uint64) error
 	GetLineage(ctx context.Context, hash string) ([]*database.ContentRecord, error)
 	FlagContent(ctx context.Context, hash, reporter, reason string, timestamp int64) error
+	VerifyPublisherDomain(ctx context.Context, domain, address string) error
+	ListVerifiedPublishers(ctx context.Context) ([]database.VerifiedPublisher, error)
 }
 
 type service struct {
@@ -298,23 +304,47 @@ func (s *service) VerifyExact(ctx context.Context, hash string) (*VerificationRe
 		flags, _ := s.repo.GetFlagCount(ctx, cached.Sha256Hash)
 		consensusCount, _ := s.repo.GetConsensusCount(ctx, cached.Sha256Hash)
 
+		pubName, _, isPubVerified := s.resolvePublisher(ctx, cached.CreatorAddress)
+		pubFlagCount, _ := s.repo.GetVerifiedPublisherFlagCount(ctx, cached.Sha256Hash)
+
+		confidenceScore := 100.0
+		if isPubVerified {
+			confidenceScore = 100.0
+		}
+		if pubFlagCount > 0 {
+			confidenceScore -= 50.0
+			if confidenceScore < 0.0 {
+				confidenceScore = 0.0
+			}
+		}
+
+		confidenceTier := "High"
+		if confidenceScore < 50.0 {
+			confidenceTier = "Low"
+		} else if confidenceScore < 80.0 {
+			confidenceTier = "Medium"
+		}
+
 		matchDetail := MatchDetail{
-			Sha256Hash:      cached.Sha256Hash,
-			CreatorAddress:  cached.CreatorAddress,
-			PHash:           cached.PHash,
-			Similarity:      100.0,
-			Timestamp:       cached.Timestamp,
-			MediaType:       cached.MediaType,
-			MatchType:       "exact",
-			ConfidenceScore: 100.0,
-			ConfidenceTier:  "High",
-			MediaIpfsUrl:    cached.MediaIpfsUrl,
-			MediaS3Url:      cached.MediaS3Url,
-			IpfsCid:         cached.IpfsCid,
-			AiTool:          cached.AiTool,
-			FlagCount:       flags,
-			ConsensusCount:  consensusCount,
-			Record:          cached,
+			Sha256Hash:           cached.Sha256Hash,
+			CreatorAddress:       cached.CreatorAddress,
+			PHash:                cached.PHash,
+			Similarity:           100.0,
+			Timestamp:            cached.Timestamp,
+			MediaType:            cached.MediaType,
+			MatchType:            "exact",
+			ConfidenceScore:      confidenceScore,
+			ConfidenceTier:       confidenceTier,
+			MediaIpfsUrl:         cached.MediaIpfsUrl,
+			MediaS3Url:           cached.MediaS3Url,
+			IpfsCid:              cached.IpfsCid,
+			AiTool:               cached.AiTool,
+			FlagCount:            flags,
+			PublisherFlagCount:   pubFlagCount,
+			ConsensusCount:       consensusCount,
+			IsPublisherVerified:  isPubVerified,
+			PublisherName:        pubName,
+			Record:               cached,
 		}
 
 		return &VerificationResult{
@@ -356,23 +386,47 @@ func (s *service) VerifyExact(ctx context.Context, hash string) (*VerificationRe
 	flags, _ := s.repo.GetFlagCount(ctx, record.Sha256Hash)
 	consensusCount, _ := s.repo.GetConsensusCount(ctx, record.Sha256Hash)
 
+	pubName, _, isPubVerified := s.resolvePublisher(ctx, record.CreatorAddress)
+	pubFlagCount, _ := s.repo.GetVerifiedPublisherFlagCount(ctx, record.Sha256Hash)
+
+	confidenceScore := 100.0
+	if isPubVerified {
+		confidenceScore = 100.0
+	}
+	if pubFlagCount > 0 {
+		confidenceScore -= 50.0
+		if confidenceScore < 0.0 {
+			confidenceScore = 0.0
+		}
+	}
+
+	confidenceTier := "High"
+	if confidenceScore < 50.0 {
+		confidenceTier = "Low"
+	} else if confidenceScore < 80.0 {
+		confidenceTier = "Medium"
+	}
+
 	matchDetail := MatchDetail{
-		Sha256Hash:      record.Sha256Hash,
-		CreatorAddress:  record.CreatorAddress,
-		PHash:           record.PHash,
-		Similarity:      100.0,
-		Timestamp:       record.Timestamp,
-		MediaType:       record.MediaType,
-		MatchType:       "exact",
-		ConfidenceScore: 100.0,
-		ConfidenceTier:  "High",
-		MediaIpfsUrl:    record.MediaIpfsUrl,
-		MediaS3Url:      record.MediaS3Url,
-		IpfsCid:         record.IpfsCid,
-		AiTool:          record.AiTool,
-		FlagCount:       flags,
-		ConsensusCount:  consensusCount,
-		Record:          record,
+		Sha256Hash:           record.Sha256Hash,
+		CreatorAddress:       record.CreatorAddress,
+		PHash:                record.PHash,
+		Similarity:           100.0,
+		Timestamp:            record.Timestamp,
+		MediaType:            record.MediaType,
+		MatchType:            "exact",
+		ConfidenceScore:      confidenceScore,
+		ConfidenceTier:       confidenceTier,
+		MediaIpfsUrl:         record.MediaIpfsUrl,
+		MediaS3Url:           record.MediaS3Url,
+		IpfsCid:              record.IpfsCid,
+		AiTool:               record.AiTool,
+		FlagCount:            flags,
+		PublisherFlagCount:   pubFlagCount,
+		ConsensusCount:       consensusCount,
+		IsPublisherVerified:  isPubVerified,
+		PublisherName:        pubName,
+		Record:               record,
 	}
 
 	return &VerificationResult{
@@ -469,6 +523,19 @@ func (s *service) VerifyFuzzy(ctx context.Context, phash uint64) (*VerificationR
 			}
 		}
 
+		pubName, _, isPubVerified := s.resolvePublisher(ctx, recordResult.Record.CreatorAddress)
+		pubFlagCount, _ := s.repo.GetVerifiedPublisherFlagCount(ctx, recordResult.Record.Sha256Hash)
+
+		if isPubVerified {
+			confidenceScore = 100.0
+		}
+		if pubFlagCount > 0 {
+			confidenceScore -= 50.0
+			if confidenceScore < 0.0 {
+				confidenceScore = 0.0
+			}
+		}
+
 		confidenceTier := "High"
 		if confidenceScore < 50.0 {
 			confidenceTier = "Low"
@@ -479,24 +546,27 @@ func (s *service) VerifyFuzzy(ctx context.Context, phash uint64) (*VerificationR
 		flags, _ := s.repo.GetFlagCount(ctx, recordResult.Record.Sha256Hash)
 
 		matchDetails = append(matchDetails, MatchDetail{
-			Sha256Hash:      recordResult.Record.Sha256Hash,
-			CreatorAddress:  recordResult.Record.CreatorAddress,
-			PHash:           recordResult.Record.PHash,
-			Similarity:      similarity,
-			Timestamp:       recordResult.Record.Timestamp,
-			MediaType:       recordResult.Record.MediaType,
-			MatchType:       "similar",
-			ConfidenceScore: confidenceScore,
-			ConfidenceTier:  confidenceTier,
-			MediaIpfsUrl:    recordResult.Record.MediaIpfsUrl,
-			MediaS3Url:      recordResult.Record.MediaS3Url,
-			IpfsCid:         recordResult.Record.IpfsCid,
-			AiTool:          recordResult.Record.AiTool,
-			OnChainVerified: verified,
-			OnChainTxHash:   txHash,
-			FlagCount:       flags,
-			ConsensusCount:  consensusCount,
-			Record:          recordResult.Record,
+			Sha256Hash:           recordResult.Record.Sha256Hash,
+			CreatorAddress:       recordResult.Record.CreatorAddress,
+			PHash:                recordResult.Record.PHash,
+			Similarity:           similarity,
+			Timestamp:            recordResult.Record.Timestamp,
+			MediaType:            recordResult.Record.MediaType,
+			MatchType:            "similar",
+			ConfidenceScore:      confidenceScore,
+			ConfidenceTier:       confidenceTier,
+			MediaIpfsUrl:         recordResult.Record.MediaIpfsUrl,
+			MediaS3Url:           recordResult.Record.MediaS3Url,
+			IpfsCid:              recordResult.Record.IpfsCid,
+			AiTool:               recordResult.Record.AiTool,
+			OnChainVerified:      verified,
+			OnChainTxHash:        txHash,
+			FlagCount:            flags,
+			PublisherFlagCount:   pubFlagCount,
+			ConsensusCount:       consensusCount,
+			IsPublisherVerified:  isPubVerified,
+			PublisherName:        pubName,
+			Record:               recordResult.Record,
 		})
 	}
 
@@ -539,24 +609,48 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 		
 		flags, _ := s.repo.GetFlagCount(ctx, exactResult.Record.Sha256Hash)
 		consensusCount, _ := s.repo.GetConsensusCount(ctx, exactResult.Record.Sha256Hash)
+
+		pubName, _, isPubVerified := s.resolvePublisher(ctx, exactResult.Record.CreatorAddress)
+		pubFlagCount, _ := s.repo.GetVerifiedPublisherFlagCount(ctx, exactResult.Record.Sha256Hash)
+
+		confidenceScore := 100.0
+		if isPubVerified {
+			confidenceScore = 100.0
+		}
+		if pubFlagCount > 0 {
+			confidenceScore -= 50.0
+			if confidenceScore < 0.0 {
+				confidenceScore = 0.0
+			}
+		}
+
+		confidenceTier := "High"
+		if confidenceScore < 50.0 {
+			confidenceTier = "Low"
+		} else if confidenceScore < 80.0 {
+			confidenceTier = "Medium"
+		}
 		
 		matchDetail := MatchDetail{
-			Sha256Hash:      exactResult.Record.Sha256Hash,
-			CreatorAddress:  exactResult.Record.CreatorAddress,
-			PHash:           exactResult.Record.PHash,
-			Similarity:      100.0,
-			Timestamp:       exactResult.Record.Timestamp,
-			MediaType:       exactResult.Record.MediaType,
-			MatchType:       "exact",
-			ConfidenceScore: 100.0,
-			ConfidenceTier:  "High",
-			MediaIpfsUrl:    exactResult.Record.MediaIpfsUrl,
-			MediaS3Url:      exactResult.Record.MediaS3Url,
-			IpfsCid:         exactResult.Record.IpfsCid,
-			AiTool:          exactResult.Record.AiTool,
-			FlagCount:       flags,
-			ConsensusCount:  consensusCount,
-			Record:          exactResult.Record,
+			Sha256Hash:           exactResult.Record.Sha256Hash,
+			CreatorAddress:       exactResult.Record.CreatorAddress,
+			PHash:                exactResult.Record.PHash,
+			Similarity:           100.0,
+			Timestamp:            exactResult.Record.Timestamp,
+			MediaType:            exactResult.Record.MediaType,
+			MatchType:            "exact",
+			ConfidenceScore:      confidenceScore,
+			ConfidenceTier:       confidenceTier,
+			MediaIpfsUrl:         exactResult.Record.MediaIpfsUrl,
+			MediaS3Url:           exactResult.Record.MediaS3Url,
+			IpfsCid:              exactResult.Record.IpfsCid,
+			AiTool:               exactResult.Record.AiTool,
+			FlagCount:            flags,
+			PublisherFlagCount:   pubFlagCount,
+			ConsensusCount:       consensusCount,
+			IsPublisherVerified:  isPubVerified,
+			PublisherName:        pubName,
+			Record:               exactResult.Record,
 		}
 
 		return &SegmentVerificationResult{
@@ -845,6 +939,19 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 			}
 		}
 
+		pubName, _, isPubVerified := s.resolvePublisher(ctx, parentResult.Record.CreatorAddress)
+		pubFlagCount, _ := s.repo.GetVerifiedPublisherFlagCount(ctx, parentResult.Record.Sha256Hash)
+
+		if isPubVerified {
+			confidenceScore = 100.0
+		}
+		if pubFlagCount > 0 {
+			confidenceScore -= 50.0
+			if confidenceScore < 0.0 {
+				confidenceScore = 0.0
+			}
+		}
+
 		confidenceTier := "High"
 		if confidenceScore < 50.0 {
 			confidenceTier = "Low"
@@ -860,28 +967,31 @@ func (s *service) VerifySegments(ctx context.Context, sha256 string, segments []
 		flags, _ := s.repo.GetFlagCount(ctx, parentResult.Record.Sha256Hash)
 
 		matchDetails = append(matchDetails, MatchDetail{
-			Sha256Hash:        parentResult.Record.Sha256Hash,
-			CreatorAddress:    parentResult.Record.CreatorAddress,
-			PHash:             parentResult.Record.PHash,
-			Similarity:        similarity,
-			Timestamp:         parentResult.Record.Timestamp,
-			MediaType:         parentResult.Record.MediaType,
-			MatchType:         matchType,
-			IsDeepfake:        isDeepfake,
-			IsAudioDeepfake:   isAudioDeepfake,
-			TemporalIntegrity: temporalIntegrity,
-			ConfidenceScore:   confidenceScore,
-			ConfidenceTier:    confidenceTier,
-			MediaIpfsUrl:      parentResult.Record.MediaIpfsUrl,
-			MediaS3Url:        parentResult.Record.MediaS3Url,
-			IpfsCid:           parentResult.Record.IpfsCid,
-			AiTool:            parentResult.Record.AiTool,
-			OnChainVerified:   verified,
-			OnChainTxHash:     txHash,
-			MatchedSegments:   finalMatchedSegments,
-			FlagCount:         flags,
-			ConsensusCount:  consensusCount,
-			Record:            parentResult.Record,
+			Sha256Hash:           parentResult.Record.Sha256Hash,
+			CreatorAddress:       parentResult.Record.CreatorAddress,
+			PHash:                parentResult.Record.PHash,
+			Similarity:           similarity,
+			Timestamp:            parentResult.Record.Timestamp,
+			MediaType:            parentResult.Record.MediaType,
+			MatchType:            matchType,
+			IsDeepfake:           isDeepfake,
+			IsAudioDeepfake:      isAudioDeepfake,
+			TemporalIntegrity:    temporalIntegrity,
+			ConfidenceScore:      confidenceScore,
+			ConfidenceTier:       confidenceTier,
+			MediaIpfsUrl:         parentResult.Record.MediaIpfsUrl,
+			MediaS3Url:           parentResult.Record.MediaS3Url,
+			IpfsCid:              parentResult.Record.IpfsCid,
+			AiTool:               parentResult.Record.AiTool,
+			OnChainVerified:      verified,
+			OnChainTxHash:        txHash,
+			MatchedSegments:      finalMatchedSegments,
+			FlagCount:            flags,
+			PublisherFlagCount:   pubFlagCount,
+			ConsensusCount:       consensusCount,
+			IsPublisherVerified:  isPubVerified,
+			PublisherName:        pubName,
+			Record:               parentResult.Record,
 		})
 	}
 
@@ -1261,4 +1371,80 @@ func (s *service) GetLineage(ctx context.Context, hash string) ([]*database.Cont
 
 func (s *service) FlagContent(ctx context.Context, hash, reporter, reason string, timestamp int64) error {
 	return s.repo.FlagContent(ctx, hash, reporter, reason, timestamp)
+}
+
+func (s *service) resolvePublisher(ctx context.Context, address string) (string, string, bool) {
+	// 1. Try On-Chain Smart Contract call first (Arbitrum L2 whitelist)
+	if s.onchainVerifier != nil {
+		org, isVerified, err := s.onchainVerifier.IsVerifiedPublisher(ctx, address)
+		if err == nil && isVerified {
+			return org, "Arbitrum L2 Contract", true
+		}
+	}
+
+	// 2. Fallback to Local PostgreSQL database cache
+	org, domain, isVerified, err := s.repo.GetVerifiedPublisher(ctx, address)
+	if err == nil && isVerified {
+		return org, domain, true
+	}
+
+	return "", "", false
+}
+
+func (s *service) VerifyPublisherDomain(ctx context.Context, domain, address string) error {
+	domainClean := strings.TrimSpace(strings.ToLower(domain))
+	if domainClean == "" {
+		return fmt.Errorf("domain cannot be empty")
+	}
+
+	url := fmt.Sprintf("https://%s/.well-known/veritrace.json", domainClean)
+	
+	httpClient := &http.Client{
+		Timeout: 5 * time.Second,
+	}
+	
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to fetch verification file from %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("domain returned HTTP status %d", resp.StatusCode)
+	}
+
+	var payload struct {
+		OrganizationName string `json:"organization_name"`
+		Domain           string `json:"domain"`
+		CreatorAddress   string `json:"creator_address"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return fmt.Errorf("failed to decode verification JSON: %w", err)
+	}
+
+	if strings.ToLower(payload.CreatorAddress) != strings.ToLower(address) {
+		return fmt.Errorf("address in verification file (%s) does not match requested wallet (%s)", payload.CreatorAddress, address)
+	}
+
+	if strings.ToLower(payload.Domain) != domainClean {
+		return fmt.Errorf("domain in verification file (%s) does not match requested domain (%s)", payload.Domain, domainClean)
+	}
+
+	verifiedAt := time.Now().Unix()
+	err = s.repo.SaveVerifiedPublisher(ctx, address, payload.OrganizationName, domainClean, verifiedAt)
+	if err != nil {
+		return fmt.Errorf("failed to save publisher to database: %w", err)
+	}
+
+	return nil
+}
+
+func (s *service) ListVerifiedPublishers(ctx context.Context) ([]database.VerifiedPublisher, error) {
+	return s.repo.ListVerifiedPublishers(ctx)
 }

@@ -180,3 +180,33 @@ func (h *Handler) FlagContent(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{"message": "content flagged successfully"})
 }
+
+func (h *Handler) VerifyPublisher(c *gin.Context) {
+	var req struct {
+		Domain  string `json:"domain" binding:"required"`
+		Address string `json:"address" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body: " + err.Error()})
+		return
+	}
+
+	err := h.service.VerifyPublisherDomain(c.Request.Context(), req.Domain, req.Address)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify domain: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "publisher identity verified and bound successfully"})
+}
+
+func (h *Handler) ListVerifiedPublishers(c *gin.Context) {
+	list, err := h.service.ListVerifiedPublishers(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list verified publishers: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"publishers": list})
+}
