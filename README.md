@@ -291,3 +291,91 @@ curl "http://localhost:8080/api/v1/verify/fuzzy?phash=9876543210123"
   }
 }
 ```
+
+---
+
+### 4. Segmented Match Verification (Videos & Documents)
+Perform multi-segmented verification matching keyframes, face vectors, speech audio patterns, and document text blocks.
+* **Endpoint**: `POST /api/v1/verify/segments`
+* **Content-Type**: `application/json`
+* **Request Body**:
+  ```json
+  {
+    "sha256": "0x123...",
+    "media_type": "video",
+    "segments": [
+      { "offset": 1, "phash": 567890123, "semantic_hash": [0.0123, -0.0456], "face_hashes": [[0.12, -0.34]] }
+    ],
+    "audio_hash": [0.05, -0.12, 0.24]
+  }
+  ```
+* **Example Response**:
+  ```json
+  {
+    "match_found": true,
+    "exact_match": false,
+    "similarity": 88.5,
+    "matched_segments": 42,
+    "total_segments_uploaded": 45,
+    "total_segments_registered": 42,
+    "coverage_uploaded_pct": 93.33,
+    "coverage_registered_pct": 100.0,
+    "is_deepfake": false,
+    "is_audio_deepfake": false,
+    "temporal_integrity": 95.8,
+    "record": { ... }
+  }
+  ```
+
+#### Detailed Matching Flow & Pipeline
+When a query request is submitted to `/verify/segments` for a video, document, or audio file, the backend evaluates the media using a multi-layered verification pipeline:
+
+```mermaid
+graph TD
+    Start[Verify Request] --> ExactCheck{1. Exact Match Check}
+    ExactCheck -->|Cache/DB Hit| Ret100[Return 100% Match]
+    ExactCheck -->|Miss| SegCheck[2. Segmented Vector Lookup]
+    SegCheck --> SearchQdrant[Query Qdrant Vector Batches]
+    SearchQdrant --> CheckThresholds{3. Apply Metric Thresholds}
+    
+    CheckThresholds --> pHashMatch[pHash Distance <= 22.0]
+    CheckThresholds --> SemanticMatch[CLIP/MiniLM Cosine >= 0.85]
+    CheckThresholds --> FaceMatch[InsightFace Cosine >= 0.60]
+    CheckThresholds --> AudioMatch[Wav2Vec2 Cosine >= 0.999]
+    
+    pHashMatch & SemanticMatch & FaceMatch & AudioMatch --> CalcCoverage[4. Compute Coverage Percentages]
+    CalcCoverage --> DeepfakeFilter{5. Deepfake Detection Checks}
+    
+    DeepfakeFilter -->|Visual match & NO Audio match| SetAudioFake[Mark Audio Deepfake / Halve Similarity]
+    DeepfakeFilter -->|Face/Semantic match only| SetVisualFake[Mark Face/Visual Deepfake]
+    
+    DeepfakeFilter --> OrderCheck{6. Sequence Alignment Check}
+    OrderCheck -->|Multiple segments match| ComputeTemporal[Calculate Temporal Integrity %]
+    OrderCheck -->|Single segment match| SkipTemporal[Temporal Integrity = 0%]
+    
+    ComputeTemporal & SkipTemporal --> FinalScore[7. Calculate Confidence & Plagiarism Alerts]
+    FinalScore --> End[Return SegmentVerificationResult]
+```
+
+1. **Exact Match Check**: The system computes the file's SHA-256 hash. If there is a cache (Redis) or database (PostgreSQL) hit, the verification resolves immediately returning `similarity: 100%`.
+2. **Segmented Vector Search**: If no exact match is found, the backend maps the uploaded segments' perceptual hashes (pHash), semantic embeddings, face vectors, and audio speech footprints. It performs batch queries against the Qdrant Vector database to locate matching segment points.
+3. **Similarity Metric Thresholds**:
+   - **pHash (Visual distance representation)**: Manhattan distance threshold of `<= 22.0` (scores higher than 22 are discarded).
+   - **Semantic Embedding (CLIP/MiniLM)**: Cosine similarity threshold of `>= 0.85`.
+   - **Face Embedding (InsightFace)**: Cosine similarity threshold of `>= 0.60`.
+   - **Audio Embedding (Wav2Vec2)**: Cosine similarity threshold of `>= 0.999`.
+4. **Candidate Coverage Requirements**:
+   - A candidate parent asset must meet coverage thresholds to prevent accidental matches:
+     - **Visual Coverage** (matched segments / uploaded segments) `* 100 >= 5.0%`
+     - **Face Coverage** (matched faces / uploaded faces) `* 100 >= 10.0%`
+     - **Semantic Coverage** (matched text/visual semantics / uploaded segments) `* 100 >= 10.0%`
+5. **Deepfake Detection Logic**:
+   - **Audio deepfakes**: If visual frames match an original work (`visual >= 5%`), but the video contains audio signals (`len(audio_hash) > 0`) and zero audio segments match the parent (`audioCount == 0`), it is classified as an **Audio Deepfake (voice cloning)**. The overall similarity score is automatically halved (`similarity = similarity * 0.5`).
+   - **Visual/Face deepfakes**: If visual coverage is low but a face match (`face >= 10%`) or a semantic meaning match (`semantic >= 10%`) triggers, it indicates an actor's face or styling has been artificially composited onto a third-party clip. The asset is labeled as a **Deepfake** and the confidence score is halved.
+6. **Sequence Alignment (Temporal Integrity)**:
+   - For visual matches, the system tracks the sequential order of the matched segments by examining their database `timestamp_offset`. 
+   - It calculates a **temporal integrity score** (from `0%` to `100%`). If the clips appear in chronological sequence matching the original, the temporal integrity remains high. If frames are spliced, out of order, or scrambled, the temporal integrity drops towards 0%.
+7. **Final Confidence Calculations**:
+   - Blends similarity and temporal integrity: `confidenceScore = (similarity * 0.7) + (temporalIntegrity * 0.3)`.
+   - Generates automatic real-time webhooks notifying original content creators if plagiarism or unauthorized deepfake derivatives are detected with `>= 80%` similarity.
+
