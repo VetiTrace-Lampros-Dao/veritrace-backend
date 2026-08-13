@@ -46,53 +46,87 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 	var semanticHashes []string
 	debugScores := make(map[string]float32)
 
-	// If a semantic search query is provided, fetch embedding and search Qdrant
-	if searchQuery != "" && h.qdrant != nil {
+	if searchQuery != "" {
+		if h.qdrant == nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "vector database client is not initialized"})
+			return
+		}
+
 		payload := map[string]string{"text": searchQuery}
-		payloadBytes, _ := json.Marshal(payload)
+		payloadBytes, err := json.Marshal(payload)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to marshal search query: " + err.Error()})
+			return
+		}
 
 		aiServiceURL := os.Getenv("AI_SERVICE_URL")
 		if aiServiceURL == "" {
-			aiServiceURL = "http://host.docker.internal:8082" // default for local mac
+			aiServiceURL = "http://host.docker.internal:8082"
 		}
 		aiURL := aiServiceURL + "/api/v1/embed_text_clip"
 
-		req, _ := http.NewRequest("POST", aiURL, bytes.NewBuffer(payloadBytes))
+		req, err := http.NewRequest("POST", aiURL, bytes.NewBuffer(payloadBytes))
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create request to AI service: " + err.Error()})
+			return
+		}
 		req.Header.Set("Content-Type", "application/json")
 
 		client := &http.Client{}
 		resp, err := client.Do(req)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to AI service at " + aiURL + ": " + err.Error()})
+			return
+		}
+		defer resp.Body.Close()
 
-		if err == nil && resp.StatusCode == 200 {
-			defer resp.Body.Close()
-			body, _ := io.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read AI service response: " + err.Error()})
+			return
+		}
 
-			var aiRes struct {
-				SemanticHash []float32 `json:"semantic_hash"`
-			}
-			if err := json.Unmarshal(body, &aiRes); err == nil && len(aiRes.SemanticHash) > 0 {
-				// Query Qdrant with the embedding
-				limit := uint64(quantity * 2)
-				scoreThreshold := float32(0.23) // Final tuned threshold
-				qResp, err := h.qdrant.Points.Search(c.Request.Context(), &pb.SearchPoints{
-					CollectionName: "veritrace_semantics",
-					Vector:         aiRes.SemanticHash,
-					Limit:          limit,
-					ScoreThreshold: &scoreThreshold,
-					WithPayload: &pb.WithPayloadSelector{
-						SelectorOptions: &pb.WithPayloadSelector_Enable{Enable: true},
-					},
-				})
+		if resp.StatusCode != 200 {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("AI service returned error status %d: %s", resp.StatusCode, string(body))})
+			return
+		}
 
-				if err == nil && qResp != nil {
-					for _, point := range qResp.GetResult() {
-						if payload, ok := point.Payload["parent_sha256"]; ok {
-							parentHash := payload.GetStringValue()
-							if parentHash != "" {
-								semanticHashes = append(semanticHashes, parentHash)
-								debugScores[parentHash] = point.Score
-							}
-						}
+		var aiRes struct {
+			SemanticHash []float32 `json:"semantic_hash"`
+		}
+		if err := json.Unmarshal(body, &aiRes); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to parse AI service response: " + err.Error()})
+			return
+		}
+
+		if len(aiRes.SemanticHash) == 0 {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "AI service returned empty embedding"})
+			return
+		}
+
+		limit := uint64(quantity * 2)
+		scoreThreshold := float32(0.23)
+		qResp, err := h.qdrant.Points.Search(c.Request.Context(), &pb.SearchPoints{
+			CollectionName: "veritrace_semantics",
+			Vector:         aiRes.SemanticHash,
+			Limit:          limit,
+			ScoreThreshold: &scoreThreshold,
+			WithPayload: &pb.WithPayloadSelector{
+				SelectorOptions: &pb.WithPayloadSelector_Enable{Enable: true},
+			},
+		})
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to search Qdrant: " + err.Error()})
+			return
+		}
+
+		if qResp != nil {
+			for _, point := range qResp.GetResult() {
+				if payload, ok := point.Payload["parent_sha256"]; ok {
+					parentHash := payload.GetStringValue()
+					if parentHash != "" {
+						semanticHashes = append(semanticHashes, parentHash)
+						debugScores[parentHash] = point.Score
 					}
 				}
 			}
