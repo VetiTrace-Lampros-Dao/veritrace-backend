@@ -1279,13 +1279,18 @@ func (s *service) PinFile(ctx context.Context, reader io.Reader, filename, conte
 	uniqueFilename := contentHash + ext
 
 	ipfsHash, err := s.pinFileToIPFS(ctx, bytes.NewReader(data), uniqueFilename)
+	gatewayBase := "gateway.pinata.cloud"
+	if s.cfg.PinataGateway != "" {
+		gatewayBase = s.cfg.PinataGateway
+	}
+
 	var ipfsUrl string
 	if err != nil {
 		mockHash := "QmMock" + contentHash[:30]
-		ipfsUrl = fmt.Sprintf("https://gateway.pinata.cloud/ipfs/%s", mockHash)
+		ipfsUrl = fmt.Sprintf("https://%s/ipfs/%s", gatewayBase, mockHash)
 		log.Printf("WARNING: Pinata IPFS upload failed (%v). Falling back to mock IPFS URL for testing: %s", err, ipfsUrl)
 	} else {
-		ipfsUrl = fmt.Sprintf("https://gateway.pinata.cloud/ipfs/%s", ipfsHash)
+		ipfsUrl = fmt.Sprintf("https://%s/ipfs/%s", gatewayBase, ipfsHash)
 	}
 
 	s3Url, err := s.storage.UploadFile(ctx, bytes.NewReader(data), uniqueFilename, contentType)

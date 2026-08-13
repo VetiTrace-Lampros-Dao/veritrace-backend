@@ -137,11 +137,15 @@ func (p *Pipeline) fetchMetadata(ctx context.Context, ipfsCid string) (*Metadata
 		return nil, fmt.Errorf("empty IPFS CID")
 	}
 
-	gateways := []string{
+	var gateways []string
+	if p.cfg.PinataGateway != "" {
+		gateways = append(gateways, "https://"+p.cfg.PinataGateway+"/ipfs/%s")
+	}
+	gateways = append(gateways,
 		"https://gateway.pinata.cloud/ipfs/%s",
 		"https://cloudflare-ipfs.com/ipfs/%s",
 		"https://ipfs.io/ipfs/%s",
-	}
+	)
 
 	client := http.Client{
 		Timeout: 10 * time.Second,
