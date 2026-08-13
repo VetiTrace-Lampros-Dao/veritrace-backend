@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math/big"
 	"net/http"
 	"os"
@@ -33,7 +34,10 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 	quantityStr := c.Query("quantity")
 	searchQuery := c.Query("query")
 
+	log.Printf("[QueryDataset] Incoming request: type=%s, quantity=%s, query=%s", mediaType, quantityStr, searchQuery)
+
 	if mediaType == "" {
+		log.Printf("[QueryDataset] Error: media type is required")
 		c.JSON(http.StatusBadRequest, gin.H{"error": "media type is required"})
 		return
 	}
@@ -48,6 +52,7 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 
 	if searchQuery != "" {
 		if h.qdrant == nil {
+			log.Printf("[QueryDataset] Error: Qdrant client is nil")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "vector database client is not initialized"})
 			return
 		}
@@ -55,6 +60,7 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 		payload := map[string]string{"text": searchQuery}
 		payloadBytes, err := json.Marshal(payload)
 		if err != nil {
+			log.Printf("[QueryDataset] Error marshaling payload: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to marshal search query: " + err.Error()})
 			return
 		}
@@ -64,9 +70,11 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 			aiServiceURL = "http://host.docker.internal:8082"
 		}
 		aiURL := aiServiceURL + "/api/v1/embed_text_clip"
+		log.Printf("[QueryDataset] Sending request to AI Service at: %s", aiURL)
 
 		req, err := http.NewRequest("POST", aiURL, bytes.NewBuffer(payloadBytes))
 		if err != nil {
+			log.Printf("[QueryDataset] Error creating AI request: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create request to AI service: " + err.Error()})
 			return
 		}
@@ -75,6 +83,7 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 		client := &http.Client{}
 		resp, err := client.Do(req)
 		if err != nil {
+			log.Printf("[QueryDataset] Error calling AI service: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to connect to AI service at " + aiURL + ": " + err.Error()})
 			return
 		}
@@ -82,11 +91,13 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
+			log.Printf("[QueryDataset] Error reading AI response: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read AI service response: " + err.Error()})
 			return
 		}
 
 		if resp.StatusCode != 200 {
+			log.Printf("[QueryDataset] AI service returned error status %d: %s", resp.StatusCode, string(body))
 			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("AI service returned error status %d: %s", resp.StatusCode, string(body))})
 			return
 		}
@@ -95,17 +106,21 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 			SemanticHash []float32 `json:"semantic_hash"`
 		}
 		if err := json.Unmarshal(body, &aiRes); err != nil {
+			log.Printf("[QueryDataset] Error unmarshaling AI response: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to parse AI service response: " + err.Error()})
 			return
 		}
 
 		if len(aiRes.SemanticHash) == 0 {
+			log.Printf("[QueryDataset] Error: AI service returned empty embedding")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "AI service returned empty embedding"})
 			return
 		}
+		log.Printf("[QueryDataset] AI service returned embedding of size %d", len(aiRes.SemanticHash))
 
 		limit := uint64(quantity * 2)
 		scoreThreshold := float32(0.23)
+		log.Printf("[QueryDataset] Searching Qdrant collection veritrace_semantics (limit=%d, scoreThreshold=%.3f)", limit, scoreThreshold)
 		qResp, err := h.qdrant.Points.Search(c.Request.Context(), &pb.SearchPoints{
 			CollectionName: "veritrace_semantics",
 			Vector:         aiRes.SemanticHash,
@@ -116,21 +131,26 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 			},
 		})
 		if err != nil {
+			log.Printf("[QueryDataset] Error searching Qdrant: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to search Qdrant: " + err.Error()})
 			return
 		}
 
 		if qResp != nil {
-			for _, point := range qResp.GetResult() {
+			log.Printf("[QueryDataset] Qdrant search returned %d raw results", len(qResp.GetResult()))
+			for i, point := range qResp.GetResult() {
+				parentHash := ""
 				if payload, ok := point.Payload["parent_sha256"]; ok {
-					parentHash := payload.GetStringValue()
-					if parentHash != "" {
-						semanticHashes = append(semanticHashes, parentHash)
-						debugScores[parentHash] = point.Score
-					}
+					parentHash = payload.GetStringValue()
+				}
+				log.Printf("[QueryDataset]   Qdrant result [%d]: ID=%s, Score=%.4f, parent_sha256=%s", i, point.Id, point.Score, parentHash)
+				if parentHash != "" {
+					semanticHashes = append(semanticHashes, parentHash)
+					debugScores[parentHash] = point.Score
 				}
 			}
 		}
+		log.Printf("[QueryDataset] Filtered semantic hashes count: %d", len(semanticHashes))
 	}
 
 	// Fetch items from PostgreSQL
@@ -140,6 +160,7 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 
 	if searchQuery != "" {
 		if len(semanticHashes) == 0 {
+			log.Printf("[QueryDataset] 404 - No semantic hashes found above threshold for query '%s'", searchQuery)
 			c.JSON(http.StatusNotFound, gin.H{"error": "no data found for this query"})
 			return
 		}
@@ -162,9 +183,11 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 		`, placeholders, len(semanticHashes)+1)
 
 		args = append(args, mediaType)
+		log.Printf("[QueryDataset] Querying DB: SELECT ... WHERE sha256_hash IN (%s) AND media_type = '%s' AND allow_ai_training = true", placeholders, mediaType)
 
 		rows, err := h.db.QueryContext(c.Request.Context(), query, args...)
 		if err != nil {
+			log.Printf("[QueryDataset] DB Query Error: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to query database"})
 			return
 		}
@@ -175,8 +198,10 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 			var hash, creator string
 			if err := rows.Scan(&hash, &creator); err == nil {
 				dbResults[hash] = creator
+				log.Printf("[QueryDataset]   DB Hit: sha256_hash=%s, creator_address=%s", hash, creator)
 			}
 		}
+		log.Printf("[QueryDataset] Total DB hits matching criteria: %d", len(dbResults))
 
 		for _, qHash := range semanticHashes {
 			if creator, exists := dbResults[qHash]; exists {
@@ -190,6 +215,7 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 		}
 
 		if totalFound == 0 {
+			log.Printf("[QueryDataset] 404 - No DB records matching search query criteria (media_type=%s, allow_ai_training=true)", mediaType)
 			c.JSON(http.StatusNotFound, gin.H{"error": "no data found for this query"})
 			return
 		}
@@ -202,9 +228,11 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 			WHERE media_type = $1 AND allow_ai_training = true
 			LIMIT $2;
 		`
+		log.Printf("[QueryDataset] Running fallback query: media_type=%s, limit=%d", mediaType, quantity)
 		args := []interface{}{mediaType, quantity}
 		rows, err := h.db.QueryContext(c.Request.Context(), query, args...)
 		if err != nil {
+			log.Printf("[QueryDataset] Fallback DB Query Error: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to query database"})
 			return
 		}
@@ -218,14 +246,17 @@ func (h *EnterpriseHandler) QueryDataset(c *gin.Context) {
 			creatorCounts[creator]++
 			hashes = append(hashes, hash)
 			totalFound++
+			log.Printf("[QueryDataset]   DB Fallback Hit: sha256_hash=%s, creator_address=%s", hash, creator)
 		}
 
 		if totalFound == 0 {
+			log.Printf("[QueryDataset] 404 - No fallback DB records found (media_type=%s, allow_ai_training=true)", mediaType)
 			c.JSON(http.StatusNotFound, gin.H{"error": "no data found for this query"})
 			return
 		}
 	}
 
+	log.Printf("[QueryDataset] Success! Total found=%d. Formulating payout distribution...", totalFound)
 	// Math logic: $1 USDC per item. (We use $1 for easy math, but 0.95 after 5% fee)
 	totalUSDC := totalFound * 1000000 // 1 USDC = 1,000,000 units
 	fee := float64(totalUSDC) * 0.05
