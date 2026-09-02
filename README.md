@@ -163,7 +163,7 @@ Set the following variables in a `.env` file inside the project directory (based
 
 ```env
 # The deployed Arbitrum Sepolia contract address
-CONTRACT_ADDRESS=0xeb09ca3b844693817479cf33fd88cdf02c2711fd
+CONTRACT_ADDRESS=0xa7bcdc220f17ebcb41a2ddded82c0317a9954c48
 
 # Backend listener and router port
 PORT=8080
